@@ -1023,9 +1023,9 @@ class GloBirdLatestGasReadingSensor(GloBirdServiceBaseSensor):
     @property
     def native_value(self) -> Any:
         """Return latest gas meter read index."""
-        return (self._service_detail().get("gas_reading_summary") or {}).get(
-            "latest_reading"
-        )
+        detail = self._service_detail()
+        val = (detail.get("gas_reading_summary") or {}).get("latest_reading")
+        return val if val is not None else (0.0 if detail else None)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -1115,7 +1115,9 @@ class GloBirdUsageTotalSensor(GloBirdServiceBaseSensor):
     @property
     def native_value(self) -> Any:
         """Return total recent usage."""
-        return (self._service_detail().get("usage_summary") or {}).get("total_usage")
+        detail = self._service_detail()
+        val = (detail.get("usage_summary") or {}).get("total_usage")
+        return val if val is not None else (0.0 if detail else None)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -1198,7 +1200,9 @@ class GloBirdSolarExportTotalSensor(GloBirdServiceBaseSensor):
     @property
     def native_value(self) -> Any:
         """Return total recent solar export (feed-in)."""
-        return (self._service_detail().get("usage_summary") or {}).get("total_export")
+        detail = self._service_detail()
+        val = (detail.get("usage_summary") or {}).get("total_export")
+        return val if val is not None else (0.0 if detail else None)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -1281,7 +1285,9 @@ class GloBirdCostTotalSensor(GloBirdServiceBaseSensor):
     @property
     def native_value(self) -> Any:
         """Return total recent cost."""
-        return (self._service_detail().get("cost_summary") or {}).get("total_amount")
+        detail = self._service_detail()
+        val = (detail.get("cost_summary") or {}).get("total_amount")
+        return val if val is not None else (0.0 if detail else None)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -1369,9 +1375,9 @@ class GloBirdSolarExportCreditTotalSensor(GloBirdServiceBaseSensor):
     @property
     def native_value(self) -> Any:
         """Return total recent solar export compensation in AUD."""
-        return (self._service_detail().get("cost_summary") or {}).get(
-            "total_export_credit"
-        )
+        detail = self._service_detail()
+        val = (detail.get("cost_summary") or {}).get("total_export_credit")
+        return val if val is not None else (0.0 if detail else None)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -1594,11 +1600,12 @@ class GloBirdBillingPeriodCostSensor(GloBirdServiceBaseSensor):
     @property
     def native_value(self) -> Any:
         """Return net cost since billing period start."""
+        detail = self._service_detail()
         start = _billing_period_start(self.coordinator.data or {})
-        cost_summary = self._service_detail().get("cost_summary") or {}
+        cost_summary = detail.get("cost_summary") or {}
         daily_totals = cost_summary.get("daily_totals", [])
         if not daily_totals:
-            return None
+            return 0.0 if detail else None
         if start is None:
             return cost_summary.get("total_amount")
         start_slash = start.strftime("%Y/%m/%d")

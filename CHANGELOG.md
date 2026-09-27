@@ -4,6 +4,11 @@ All notable changes to this project are documented in this file.
 
 This project uses Home Assistant's calendar versioning scheme (`YYYY.M.P`, for example `2026.10.0`).
 
+## [2026.10.2] - 2026-09-28
+
+### Fixed
+- Defaulted cumulative Energy Dashboard sensors (`Recent Usage Total`, `Recent Solar Export Total`, `Recent Cost Total`, `Recent Solar Export Credit Total`, `Billing Period Cost`, and `Latest Gas Reading`) to `0.0` when a newly onboarded service has no meter reads yet, ensuring Home Assistant's Recorder immediately registers their long-term statistics metadata without `statistics_not_defined` or `entity_unavailable` warnings.
+
 ## [2026.10.1] - 2026-09-28
 
 ### Fixed

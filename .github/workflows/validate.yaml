@@ -12,7 +12,7 @@ jobs:
     name: Version & Changelog
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Validate manifest.json and CHANGELOG.md version sync
         run: |
@@ -48,7 +48,7 @@ jobs:
     name: HACS
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: HACS validation
         uses: hacs/action@main
@@ -59,7 +59,7 @@ jobs:
     name: Hassfest
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Hassfest validation
         uses: home-assistant/actions/hassfest@master

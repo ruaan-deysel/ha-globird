@@ -4,6 +4,11 @@ All notable changes to this project are documented in this file.
 
 This project uses Home Assistant's calendar versioning scheme (`YYYY.M.P`, for example `2026.10.0`).
 
+## [2026.10.1] - 2026-09-28
+
+### Fixed
+- Relaxed `pydantic` requirement in `custom_components/globird/manifest.json` from `pydantic>=2.13.5` to `pydantic>=2.0.0` so it resolves cleanly against Home Assistant Core's pinned `package_constraints.txt` (`pydantic==2.13.4`) when loading the config flow.
+
 ## [2026.10.0] - 2026-09-28
 
 ### Added

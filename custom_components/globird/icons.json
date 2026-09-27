@@ -1,0 +1,91 @@
+{
+  "entity": {
+    "sensor": {
+      "balance": {
+        "default": "mdi:cash"
+      },
+      "dashboard_balance": {
+        "default": "mdi:view-dashboard"
+      },
+      "latest_invoice": {
+        "default": "mdi:file-document"
+      },
+      "signup_services": {
+        "default": "mdi:transmission-tower"
+      },
+      "last_successful_refresh": {
+        "default": "mdi:update"
+      },
+      "refresh_status": {
+        "default": "mdi:cloud-refresh"
+      },
+      "account_summary": {
+        "default": "mdi:account"
+      },
+      "service_status": {
+        "default": "mdi:transmission-tower"
+      },
+      "meter_info": {
+        "default": "mdi:counter"
+      },
+      "latest_data_date": {
+        "default": "mdi:calendar-check"
+      },
+      "latest_data_status": {
+        "default": "mdi:calendar-sync"
+      },
+      "latest_gas_reading": {
+        "default": "mdi:meter-gas"
+      },
+      "latest_gas_reading_date": {
+        "default": "mdi:calendar-clock"
+      },
+      "usage_total": {
+        "default": "mdi:lightning-bolt"
+      },
+      "latest_day_usage": {
+        "default": "mdi:calendar-today"
+      },
+      "solar_export_total": {
+        "default": "mdi:solar-power"
+      },
+      "latest_day_solar_export": {
+        "default": "mdi:solar-power-variant"
+      },
+      "cost_total": {
+        "default": "mdi:cash-multiple"
+      },
+      "latest_day_cost": {
+        "default": "mdi:calendar-today"
+      },
+      "solar_export_credit_total": {
+        "default": "mdi:cash-plus"
+      },
+      "latest_day_solar_export_credit": {
+        "default": "mdi:cash-refund"
+      },
+      "zerohero_status": {
+        "default": "mdi:check-decagram",
+        "state": {
+          "achieved": "mdi:check-decagram",
+          "missed": "mdi:close-octagon-outline",
+          "pending": "mdi:clock-outline",
+          "awaiting_result": "mdi:timer-sand",
+          "unknown": "mdi:help-circle-outline"
+        }
+      },
+      "expected_month_cost": {
+        "default": "mdi:cash-clock"
+      },
+      "billing_period_days": {
+        "default": "mdi:calendar-range"
+      },
+      "billing_period_cost": {
+        "default": "mdi:cash-clock"
+      },
+      "weather_summary": {
+        "default": "mdi:weather-partly-cloudy"
+      }
+    }
+  }
+}

@@ -59,6 +59,25 @@ class ConfigFlow:
     def _abort_if_unique_id_configured(self) -> None:
         return None
 
+    def _abort_if_unique_id_mismatch(self, *, reason: str = "wrong_account") -> None:
+        return None
+
+    def _get_reauth_entry(self) -> ConfigEntry:
+        return ConfigEntry(data={"email": "user@example.test"})
+
+    def _get_reconfigure_entry(self) -> ConfigEntry:
+        return ConfigEntry(data={"email": "user@example.test"})
+
+    def async_update_reload_and_abort(
+        self, entry: Any, *, data_updates: dict[str, Any]
+    ) -> dict[str, Any]:
+        return {
+            "type": "abort",
+            "reason": "reconfigure_successful",
+            "entry": entry,
+            "data_updates": data_updates,
+        }
+
     def async_create_entry(self, **kwargs: Any) -> dict[str, Any]:
         return {"type": "create_entry", **kwargs}
 
@@ -77,10 +96,15 @@ class OptionsFlow:
 
 
 class ConfigEntry:
-    """Minimal config entry carrying options for the options flow."""
+    """Minimal config entry carrying options and data for config/options flows."""
 
-    def __init__(self, options: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        options: dict[str, Any] | None = None,
+        data: dict[str, Any] | None = None,
+    ) -> None:
         self.options = options or {}
+        self.data = data or {}
 
 
 class TextSelector:
@@ -96,6 +120,7 @@ class TimeSelector:
 
 config_entries.ConfigEntry = ConfigEntry
 config_entries.ConfigFlow = ConfigFlow
+config_entries.ConfigFlowResult = dict[str, Any]
 config_entries.OptionsFlow = OptionsFlow
 data_entry_flow.FlowResult = dict[str, Any]
 voluptuous.Required = Required
@@ -155,6 +180,15 @@ def test_options_flow_saves_daily_poll_start_time() -> None:
         "title": "",
         "data": {"daily_poll_start_time": "03:00"},
     }
+
+
+def test_user_step_shows_initial_form() -> None:
+    """Initial user step without input should render the user form."""
+    flow = config_flow.GloBirdConfigFlow()
+    result = asyncio.run(flow.async_step_user())
+
+    assert result["type"] == "form"
+    assert result["step_id"] == "user"
 
 
 def test_user_step_creates_entry_on_valid_auth(monkeypatch: Any) -> None:
@@ -239,3 +273,143 @@ def test_user_step_maps_unknown_error_to_cannot_connect(monkeypatch: Any) -> Non
 
     assert result["type"] == "form"
     assert result["errors"]["base"] == "cannot_connect"
+
+
+def test_reauth_and_reauth_confirm_flow(monkeypatch: Any) -> None:
+    """Reauth flow should show confirm form and update entry on valid credentials."""
+
+    class FakeClient:
+        async def authenticate(self, _email: str, _password: str) -> dict[str, Any]:
+            return {"success": True}
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(config_flow, "GloBirdClient", lambda: FakeClient())
+
+    flow = config_flow.GloBirdConfigFlow()
+    form_result = asyncio.run(flow.async_step_reauth({"email": "user@example.test"}))
+    assert form_result["type"] == "form"
+    assert form_result["step_id"] == "reauth_confirm"
+
+    submit_result = asyncio.run(
+        flow.async_step_reauth_confirm(
+            {"email": "user@example.test", "password": "new-password"}
+        )
+    )
+    assert submit_result["type"] == "abort"
+    assert submit_result["data_updates"]["password"] == "new-password"
+
+
+def test_reauth_confirm_without_helper_creates_entry(monkeypatch: Any) -> None:
+    """Reauth confirm falls back to create_entry when _reauth_entry is unavailable."""
+
+    class FakeClient:
+        async def authenticate(self, _email: str, _password: str) -> dict[str, Any]:
+            return {"success": True}
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(config_flow, "GloBirdClient", lambda: FakeClient())
+
+    flow = config_flow.GloBirdConfigFlow()
+    monkeypatch.delattr(
+        config_flow.config_entries.ConfigFlow, "_get_reauth_entry", raising=False
+    )
+    monkeypatch.delattr(
+        config_flow.config_entries.ConfigFlow,
+        "async_update_reload_and_abort",
+        raising=False,
+    )
+
+    result = asyncio.run(
+        flow.async_step_reauth_confirm(
+            {"email": "user@example.test", "password": "new-password"}
+        )
+    )
+    assert result["type"] == "create_entry"
+
+
+def test_reconfigure_flow(monkeypatch: Any) -> None:
+    """Reconfigure step should show form and update entry when submitted."""
+
+    class FakeClient:
+        async def authenticate(self, _email: str, _password: str) -> dict[str, Any]:
+            return {"success": True}
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(config_flow, "GloBirdClient", lambda: FakeClient())
+
+    flow = config_flow.GloBirdConfigFlow()
+    form_result = asyncio.run(flow.async_step_reconfigure())
+    assert form_result["type"] == "form"
+    assert form_result["step_id"] == "reconfigure"
+
+    submit_result = asyncio.run(
+        flow.async_step_reconfigure(
+            {"email": "user@example.test", "password": "updated"}
+        )
+    )
+    assert submit_result["type"] == "abort"
+    assert submit_result["data_updates"]["password"] == "updated"
+
+
+def test_reconfigure_without_helper_creates_entry(monkeypatch: Any) -> None:
+    """Reconfigure falls back to create_entry when _get_reconfigure_entry is absent."""
+
+    class FakeClient:
+        async def authenticate(self, _email: str, _password: str) -> dict[str, Any]:
+            return {"success": True}
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(config_flow, "GloBirdClient", lambda: FakeClient())
+    monkeypatch.delattr(
+        config_flow.config_entries.ConfigFlow, "_get_reconfigure_entry", raising=False
+    )
+    monkeypatch.delattr(
+        config_flow.config_entries.ConfigFlow,
+        "async_update_reload_and_abort",
+        raising=False,
+    )
+
+    flow = config_flow.GloBirdConfigFlow()
+    result = asyncio.run(
+        flow.async_step_reconfigure(
+            {"email": "user@example.test", "password": "updated"}
+        )
+    )
+    assert result["type"] == "create_entry"
+
+
+def test_reauth_and_reconfigure_error_branches(monkeypatch: Any) -> None:
+    """Reauth and reconfigure steps should re-render forms when credentials fail."""
+
+    class FailingClient:
+        async def authenticate(self, _email: str, _password: str) -> dict[str, Any]:
+            raise config_flow.GloBirdAuthError()
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(config_flow, "GloBirdClient", lambda: FailingClient())
+
+    flow = config_flow.GloBirdConfigFlow()
+    flow._reauth_entry = ConfigEntry(data={"email": "user@example.test"})
+    reauth_err = asyncio.run(
+        flow.async_step_reauth_confirm(
+            {"email": "user@example.test", "password": "bad"}
+        )
+    )
+    assert reauth_err["type"] == "form"
+    assert reauth_err["errors"]["base"] == "invalid_auth"
+
+    reconfig_err = asyncio.run(
+        flow.async_step_reconfigure({"email": "user@example.test", "password": "bad"})
+    )
+    assert reconfig_err["type"] == "form"
+    assert reconfig_err["errors"]["base"] == "invalid_auth"

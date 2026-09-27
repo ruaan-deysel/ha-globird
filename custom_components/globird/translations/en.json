@@ -7,6 +7,34 @@
         "data": {
           "email": "Email",
           "password": "Password"
+        },
+        "data_description": {
+          "email": "The email address used to sign in to the GloBird customer portal.",
+          "password": "Your GloBird customer portal password."
+        }
+      },
+      "reauth_confirm": {
+        "title": "Re-authenticate GloBird",
+        "description": "Your GloBird session or credentials need to be updated.",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        },
+        "data_description": {
+          "email": "The email address used to sign in to the GloBird customer portal.",
+          "password": "Your updated GloBird customer portal password."
+        }
+      },
+      "reconfigure": {
+        "title": "Reconfigure GloBird",
+        "description": "Update the credentials for your GloBird account.",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        },
+        "data_description": {
+          "email": "The email address for your GloBird account.",
+          "password": "Your GloBird customer portal password."
         }
       }
     },
@@ -17,18 +45,29 @@
       "unknown": "Unexpected error"
     },
     "abort": {
-      "already_configured": "This GloBird account is already configured"
+      "already_configured": "This GloBird account is already configured",
+      "reauth_successful": "Re-authentication was successful",
+      "reconfigure_successful": "Reconfiguration was successful",
+      "wrong_account": "The email address does not match the configured GloBird account"
     }
   },
   "options": {
     "step": {
       "init": {
-        "title": "GloBird HA options",
+        "title": "GloBird options",
         "description": "Set when automatic daily readiness polling resumes after the previous day is ready.",
         "data": {
           "daily_poll_start_time": "Daily polling start time"
+        },
+        "data_description": {
+          "daily_poll_start_time": "Local time of day when automatic polling resumes to check for yesterday's meter data."
         }
       }
+    }
+  },
+  "exceptions": {
+    "auth_failed": {
+      "message": "Authentication with GloBird failed: {error}"
     }
   },
   "entity": {
@@ -66,6 +105,12 @@
       "latest_data_status": {
         "name": "Latest Data Status"
       },
+      "latest_gas_reading": {
+        "name": "Latest Gas Reading"
+      },
+      "latest_gas_reading_date": {
+        "name": "Latest Gas Reading Date"
+      },
       "usage_total": {
         "name": "Recent Usage Total"
       },
@@ -84,8 +129,21 @@
       "latest_day_cost": {
         "name": "Latest Daily Cost"
       },
+      "solar_export_credit_total": {
+        "name": "Recent Solar Export Credit Total"
+      },
+      "latest_day_solar_export_credit": {
+        "name": "Latest Daily Solar Export Credit"
+      },
       "zerohero_status": {
-        "name": "ZeroHero Status"
+        "name": "ZeroHero Status",
+        "state": {
+          "achieved": "Achieved",
+          "missed": "Missed",
+          "pending": "Pending",
+          "awaiting_result": "Awaiting result",
+          "unknown": "Unknown"
+        }
       },
       "expected_month_cost": {
         "name": "Expected Monthly Cost"

@@ -7,6 +7,7 @@ import importlib
 import sys
 import types
 from pathlib import Path
+from typing import Any
 
 COMPONENT_PATH = Path(__file__).parents[1] / "custom_components"
 INTEGRATION_PATH = COMPONENT_PATH / "globird"
@@ -57,12 +58,16 @@ class FakeHass:
 
 
 class FakeEntry:
-    def __init__(self) -> None:
+    def __init__(self, data: dict[str, Any] | None = None) -> None:
         self.entry_id = "entry-1"
-        self.data = {
-            "email": "user@example.test",
-            "password": "secret",
-        }
+        self.data = (
+            data
+            if data is not None
+            else {
+                "email": "user@example.test",
+                "password": "secret",
+            }
+        )
 
 
 def test_async_get_config_entry_diagnostics_redacts_sensitive_values() -> None:
@@ -73,3 +78,13 @@ def test_async_get_config_entry_diagnostics_redacts_sensitive_values() -> None:
 
     assert payload["entry"]["password"] == "**REDACTED**"
     assert payload["data"]["accounts"][0]["accountNumber"] == "**REDACTED**"
+
+
+def test_async_get_config_entry_diagnostics_without_password_key() -> None:
+    """Diagnostics should succeed when password key is absent from entry data."""
+    payload = asyncio.run(
+        diagnostics.async_get_config_entry_diagnostics(
+            FakeHass(), FakeEntry(data={"email": "user@example.test"})
+        )
+    )
+    assert payload["entry"]["email"] == "**REDACTED**"

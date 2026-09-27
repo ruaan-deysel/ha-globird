@@ -19,6 +19,7 @@ from yarl import URL
 
 from ..const import BASE_URL, DEFAULT_USAGE_DAYS, SENSITIVE_KEYS
 from .models import (
+    BillingPeriodProjection,
     CostSummary,
     GasReadingSummary,
     LatestDataStatus,
@@ -99,6 +100,18 @@ def _cost_category(row: dict[str, Any]) -> str:
 def _is_supply_cost(row: dict[str, Any]) -> bool:
     """Return whether a cost row is only the fixed supply charge."""
     return _cost_category(row).upper() == "SUPPLY"
+
+
+def _is_export_cost_row(row: dict[str, Any]) -> bool:
+    """Return whether a cost row represents solar export/feed-in credit."""
+    category = _cost_category(row).lower()
+    charge_type = str(row.get("chargeType") or "").strip().lower()
+    if category == "solar":
+        return True
+    export_markers = ("export", "feed-in", "feed in", "feedin")
+    return any(marker in category for marker in export_markers) or any(
+        marker in charge_type for marker in export_markers
+    )
 
 
 def _is_complete_cost_day(rows: list[dict[str, Any]]) -> bool:
@@ -190,7 +203,11 @@ def cost_attributes(summary: dict[str, Any]) -> dict[str, Any]:
     return {
         "days": summary.get("days"),
         "total_quantity": summary.get("total_quantity"),
+        "total_import_cost": summary.get("total_import_cost"),
+        "total_export_credit": summary.get("total_export_credit"),
         "latest_day": summary.get("latest_day"),
+        "latest_day_import_cost": summary.get("latest_day_import_cost"),
+        "latest_day_export_credit": summary.get("latest_day_export_credit"),
         "latest_available_day": summary.get("latest_available_day"),
         "latest_available_day_complete": summary.get("latest_available_day_complete"),
         "incomplete_days": summary.get("incomplete_days", []),
@@ -648,17 +665,21 @@ def build_gas_reading_summary(
 
 
 def build_cost_summary(cost_payload: dict[str, Any] | None) -> dict[str, Any]:
-    """Build recorder-safe cost summary."""
+    """Build recorder-safe cost summary including import cost and solar export credit."""
     rows = _payload_data(cost_payload)
     if not isinstance(rows, list):
         rows = []
 
     daily: list[dict[str, Any]] = []
     daily_totals: dict[str, float] = {}
+    daily_import_totals: dict[str, float] = {}
+    daily_export_credit_totals: dict[str, float] = {}
     available_daily: list[dict[str, Any]] = []
     categories: dict[str, dict[str, Any]] = {}
     total_amount = 0.0
     total_quantity = 0.0
+    total_import_cost = 0.0
+    total_export_credit = 0.0
     grouped_rows: dict[str, list[dict[str, Any]]] = {}
 
     for raw_row in rows:
@@ -691,6 +712,18 @@ def build_cost_summary(cost_payload: dict[str, Any] | None) -> dict[str, Any]:
         total_amount += amount
         total_quantity += quantity
         daily_totals[dk] = daily_totals.get(dk, 0.0) + amount
+        if _is_export_cost_row(row):
+            credit_amount = abs(amount)
+            total_export_credit += credit_amount
+            daily_export_credit_totals[dk] = (
+                daily_export_credit_totals.get(dk, 0.0) + credit_amount
+            )
+            daily_import_totals.setdefault(dk, 0.0)
+        else:
+            total_import_cost += amount
+            daily_import_totals[dk] = daily_import_totals.get(dk, 0.0) + amount
+            daily_export_credit_totals.setdefault(dk, 0.0)
+
         category = _cost_category(row)
         if category not in categories:
             categories[category] = {
@@ -705,10 +738,16 @@ def build_cost_summary(cost_payload: dict[str, Any] | None) -> dict[str, Any]:
     # GloBird returns multiple rows per day (SOLAR, USAGE, SUPPLY, etc.). Sum all
     # complete-day rows so early supply-only rows don't become the latest daily cost.
     latest_day_amount: float | None = None
+    latest_day_import_cost: float | None = None
+    latest_day_export_credit: float | None = None
     latest_day_zerohero_credit: float | None = None
     if latest_day:
         latest_day_amount = _round(
             sum(e["amount"] for e in daily if e["date"] == latest_day), 2
+        )
+        latest_day_import_cost = _round(daily_import_totals.get(latest_day, 0.0), 2)
+        latest_day_export_credit = _round(
+            daily_export_credit_totals.get(latest_day, 0.0), 2
         )
         zerohero_total = sum(
             e["amount"]
@@ -723,8 +762,16 @@ def build_cost_summary(cost_payload: dict[str, Any] | None) -> dict[str, Any]:
             "days": len(daily),
             "total_amount": _round(total_amount, 2),
             "total_quantity": _round(total_quantity),
+            "total_import_cost": _round(total_import_cost, 2)
+            if complete_days
+            else None,
+            "total_export_credit": (
+                _round(total_export_credit, 2) if complete_days else None
+            ),
             "latest_day": latest_day,
             "latest_day_amount": latest_day_amount,
+            "latest_day_import_cost": latest_day_import_cost,
+            "latest_day_export_credit": latest_day_export_credit,
             "latest_available_day": latest_available_day,
             "latest_available_day_complete": (
                 latest_available_day is not None and latest_available_day == latest_day
@@ -736,8 +783,16 @@ def build_cost_summary(cost_payload: dict[str, Any] | None) -> dict[str, Any]:
             ),
             "daily": daily,
             "daily_totals": [
-                {"date": day, "amount": _round(amount, 2)}
+                {"date": day, "amount": _round(amount, 2) or 0.0}
                 for day, amount in sorted(daily_totals.items())
+            ],
+            "daily_import_totals": [
+                {"date": day, "amount": _round(amount, 2) or 0.0}
+                for day, amount in sorted(daily_import_totals.items())
+            ],
+            "daily_export_credit_totals": [
+                {"date": day, "amount": _round(amount, 2) or 0.0}
+                for day, amount in sorted(daily_export_credit_totals.items())
             ],
             "available_daily": available_daily,
             "incomplete_days": sorted(set(grouped_rows) - complete_days),
@@ -885,16 +940,18 @@ def build_billing_period_projection(
 ) -> dict[str, Any]:
     """Project billing-period cost from completed daily net totals."""
     if billing_period_start is None or not isinstance(daily_totals, list):
-        return {
-            "billing_period_start": (
-                billing_period_start.isoformat() if billing_period_start else None
-            ),
-            "cost_to_date": None,
-            "projected_cost": None,
-            "completed_days": 0,
-            "period_days": period_days,
-            "latest_day": None,
-        }
+        return BillingPeriodProjection.model_validate(
+            {
+                "billing_period_start": (
+                    billing_period_start.isoformat() if billing_period_start else None
+                ),
+                "cost_to_date": None,
+                "projected_cost": None,
+                "completed_days": 0,
+                "period_days": period_days,
+                "latest_day": None,
+            }
+        ).model_dump(mode="json")
 
     totals: dict[date, float] = {}
     for row in daily_totals:
@@ -908,28 +965,32 @@ def build_billing_period_projection(
         )
 
     if not totals:
-        return {
-            "billing_period_start": billing_period_start.isoformat(),
-            "cost_to_date": None,
-            "projected_cost": None,
-            "completed_days": 0,
-            "period_days": period_days,
-            "latest_day": None,
-        }
+        return BillingPeriodProjection.model_validate(
+            {
+                "billing_period_start": billing_period_start.isoformat(),
+                "cost_to_date": None,
+                "projected_cost": None,
+                "completed_days": 0,
+                "period_days": period_days,
+                "latest_day": None,
+            }
+        ).model_dump(mode="json")
 
     latest_day = max(totals)
     completed_days = max(1, (latest_day - billing_period_start).days + 1)
     cost_to_date = sum(totals.values())
     projected_cost = cost_to_date / completed_days * period_days
 
-    return {
-        "billing_period_start": billing_period_start.isoformat(),
-        "cost_to_date": _round(cost_to_date, 2),
-        "projected_cost": _round(projected_cost, 2),
-        "completed_days": completed_days,
-        "period_days": period_days,
-        "latest_day": latest_day.isoformat(),
-    }
+    return BillingPeriodProjection.model_validate(
+        {
+            "billing_period_start": billing_period_start.isoformat(),
+            "cost_to_date": _round(cost_to_date, 2),
+            "projected_cost": _round(projected_cost, 2),
+            "completed_days": completed_days,
+            "period_days": period_days,
+            "latest_day": latest_day.isoformat(),
+        }
+    ).model_dump(mode="json")
 
 
 def build_weather_summary(weather_payload: dict[str, Any] | None) -> dict[str, Any]:
@@ -1031,7 +1092,7 @@ class GloBirdClient:
             "Accept": "application/json, text/plain, */*",
             "Origin": self._base_url,
             "Referer": f"{self._base_url}/",
-            "User-Agent": "GloBird-HA/0.1",
+            "User-Agent": "GloBird-HA/2026.10.0",
         }
 
     async def _raw_request_json(

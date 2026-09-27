@@ -1,6 +1,6 @@
-"""Public API surface for the GloBird integration client package."""
+"""Client module for the GloBird integration."""
 
-from .client import (
+from .api.client import (
     GloBirdApiError,
     GloBirdAuthError,
     GloBirdCaptchaRequired,

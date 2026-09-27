@@ -13,16 +13,19 @@ from .coordinator import GloBirdCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS = [Platform.SENSOR]
+type GloBirdConfigEntry = ConfigEntry[GloBirdCoordinator]
+
+PLATFORMS: list[Platform] = [Platform.SENSOR]
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_setup_entry(hass: HomeAssistant, entry: GloBirdConfigEntry) -> bool:
     """Set up GloBird from a config entry."""
     hass.data.setdefault(DOMAIN, {})
 
     coordinator = GloBirdCoordinator(hass, entry)
     await coordinator.async_config_entry_first_refresh()
 
+    entry.runtime_data = coordinator
     hass.data[DOMAIN][entry.entry_id] = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
@@ -30,15 +33,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     return True
 
 
-async def async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None:
+async def async_update_options(hass: HomeAssistant, entry: GloBirdConfigEntry) -> None:
     """Reload the integration when options change."""
     await hass.config_entries.async_reload(entry.entry_id)
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+async def async_unload_entry(hass: HomeAssistant, entry: GloBirdConfigEntry) -> bool:
     """Unload a config entry."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
-        coordinator: GloBirdCoordinator = hass.data[DOMAIN].pop(entry.entry_id)
-        await coordinator.async_shutdown()
+        domain_data = hass.data.get(DOMAIN, {})
+        coordinator: GloBirdCoordinator | None = domain_data.pop(
+            entry.entry_id, None
+        ) or getattr(entry, "runtime_data", None)
+        if coordinator is not None:
+            await coordinator.async_shutdown()
     return unload_ok

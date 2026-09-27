@@ -24,7 +24,10 @@ def _compact(payload: dict[str, Any] | None) -> str:
 
 
 async def run_query(email: str, password: str) -> int:
-    from custom_components.globird.api import GloBirdClient
+    from custom_components.globird.client import (
+        GloBirdClient,
+        extract_accounts_and_services,
+    )
 
     client = GloBirdClient()
     try:
@@ -32,13 +35,24 @@ async def run_query(email: str, password: str) -> int:
         print("# current_user")
         print(_compact(current_user))
 
-        dashboard = await client.get_dashboard()
+        accounts, services = extract_accounts_and_services(current_user)
+        account_id = (
+            services[0].get("accountId")
+            if services
+            else (accounts[0].get("accountId") if accounts else None)
+        )
+
+        dashboard = await client.get_dashboard(account_id=account_id)
         print("\n# dashboard")
         print(_compact(dashboard))
 
-        balance = await client.get_balance()
+        balance = await client.get_balance(account_id=account_id)
         print("\n# balance")
         print(_compact(balance))
+
+        signup_info = await client.get_signup_info(account_id=account_id)
+        print("\n# signup_info")
+        print(_compact(signup_info))
 
         return 0
     except Exception as err:  # noqa: BLE001 - CLI should print actionable error.

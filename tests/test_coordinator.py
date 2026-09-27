@@ -49,6 +49,9 @@ class DataUpdateCoordinator:
 class Store:
     """Minimal stand-in for Home Assistant storage."""
 
+    def __class_getitem__(cls, _item: Any) -> type[Store]:
+        return cls
+
     def __init__(self, *_args: Any, **_kwargs: Any) -> None:
         pass
 
@@ -57,6 +60,18 @@ class UpdateFailed(Exception):
     """Minimal stand-in for Home Assistant's update failure."""
 
 
+exceptions = types.ModuleType("homeassistant.exceptions")
+
+
+class ConfigEntryAuthFailed(Exception):
+    """Minimal stand-in for Home Assistant's ConfigEntryAuthFailed."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args)
+        self.kwargs = kwargs
+
+
+exceptions.ConfigEntryAuthFailed = ConfigEntryAuthFailed
 config_entries.ConfigEntry = object
 core.HomeAssistant = object
 storage.Store = Store
@@ -70,12 +85,14 @@ helpers.storage = storage
 helpers.update_coordinator = update_coordinator
 homeassistant.config_entries = config_entries
 homeassistant.core = core
+homeassistant.exceptions = exceptions
 homeassistant.helpers = helpers
 homeassistant.util = util
 
 sys.modules["homeassistant"] = homeassistant
 sys.modules["homeassistant.config_entries"] = config_entries
 sys.modules["homeassistant.core"] = core
+sys.modules["homeassistant.exceptions"] = exceptions
 sys.modules["homeassistant.helpers"] = helpers
 sys.modules["homeassistant.helpers.storage"] = storage
 sys.modules["homeassistant.helpers.update_coordinator"] = update_coordinator
@@ -541,3 +558,79 @@ def test_async_update_data_raises_update_failed_without_cache() -> None:
         pass
     else:
         raise AssertionError("Expected UpdateFailed")
+
+
+def test_async_update_data_raises_config_entry_auth_failed_on_auth_error() -> None:
+    """Authentication errors during update should raise ConfigEntryAuthFailed."""
+
+    class FakeClient:
+        is_authenticated = True
+
+        async def get_current_user(self) -> dict[str, Any]:
+            raise coordinator.GloBirdAuthError("bad password")
+
+    instance = object.__new__(coordinator.GloBirdCoordinator)
+    instance.email = "u"
+    instance.password = "p"
+    instance.client = FakeClient()
+    instance._initialized = True
+    instance._cache = {"service_data": {}}
+    instance.update_interval = coordinator.ACCOUNT_UPDATE_INTERVAL
+
+    try:
+        asyncio.run(instance._async_update_data())
+    except coordinator.ConfigEntryAuthFailed:
+        pass
+    else:
+        raise AssertionError("Expected ConfigEntryAuthFailed")
+
+
+def test_parse_daily_poll_start_time_and_weather_fetch() -> None:
+    """Malformed time falls back to default and weather fetch runs when postCode is set."""
+    assert (
+        coordinator._parse_daily_poll_start_time("bad:time").isoformat() == "00:05:00"
+    )
+
+    class FakeClient:
+        async def get_read_meters(self, **_kwargs: Any) -> Any:
+            return None
+
+        async def get_usage(self, **_kwargs: Any) -> dict[str, Any]:
+            return {"data": [], "success": True}
+
+        async def get_cost_detail(self, **_kwargs: Any) -> dict[str, Any]:
+            return {"data": [], "success": True}
+
+        async def get_weather_data(self, **_kwargs: Any) -> dict[str, Any]:
+            return {
+                "data": [
+                    {"dateAsDate": "2026-06-28", "obMinTemp": 10, "obMaxTemp": 20}
+                ],
+                "success": True,
+            }
+
+    instance = object.__new__(coordinator.GloBirdCoordinator)
+    instance.client = FakeClient()
+    detail = asyncio.run(
+        instance._fetch_service_detail(
+            {
+                "accountServiceId": 10,
+                "siteIdentifier": "NMI-1",
+                "serviceType": "Power",
+                "postCode": "3000",
+            },
+            {
+                "data": [
+                    {
+                        "siteIdentifier": "NMI-1",
+                        "serialNumber": "m1",
+                        "meterReadType": "SMART",
+                        "serialStatus": "Active",
+                    }
+                ]
+            },
+            None,
+            {},
+        )
+    )
+    assert detail["weather_summary"]["latest_max_temp"] == 20

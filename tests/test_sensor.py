@@ -107,6 +107,9 @@ class DataUpdateCoordinator:
 class Store:
     """Minimal stand-in for Home Assistant storage."""
 
+    def __class_getitem__(cls, _item: Any) -> type[Store]:
+        return cls
+
     def __init__(self, *_args: Any, **_kwargs: Any) -> None:
         return None
 
@@ -130,6 +133,7 @@ sensor_component.SensorDeviceClass = SensorDeviceClass
 sensor_component.SensorEntity = SensorEntity
 sensor_component.SensorStateClass = SensorStateClass
 config_entries.ConfigEntry = object
+const.EntityCategory = types.SimpleNamespace(DIAGNOSTIC="diagnostic")
 const.UnitOfEnergy = types.SimpleNamespace(KILO_WATT_HOUR="kWh")
 const.UnitOfTemperature = types.SimpleNamespace(CELSIUS="C")
 const.UnitOfVolume = types.SimpleNamespace(CUBIC_METERS="m3")
@@ -142,7 +146,10 @@ update_coordinator.CoordinatorEntity = CoordinatorEntity
 update_coordinator.DataUpdateCoordinator = DataUpdateCoordinator
 update_coordinator.UpdateFailed = UpdateFailed
 recorder_models.StatisticMeanType = StatisticMeanType
+recorder_models.StatisticData = lambda **kwargs: dict(kwargs)
+recorder_models.StatisticMetaData = lambda **kwargs: dict(kwargs)
 unit_conversion.VolumeConverter = types.SimpleNamespace(UNIT_CLASS="volume")
+unit_conversion.EnergyConverter = types.SimpleNamespace(UNIT_CLASS="energy")
 dt.now = lambda: datetime.now(UTC)
 util.dt = dt
 util_logging.log_exception = lambda *_args, **_kwargs: None
@@ -190,7 +197,7 @@ def load_gas_fixtures() -> dict[str, Any]:
 
 def test_expected_monthly_cost_uses_existing_mdi_icon() -> None:
     """Expected Monthly Cost should not point at a non-existent MDI icon."""
-    assert sensor.GloBirdExpectedMonthlyCostSensor.icon == "mdi:cash-clock"
+    assert sensor.GloBirdExpectedMonthlyCostSensor.sensor_icon == "mdi:cash-clock"
 
 
 def test_billing_period_days_uses_home_assistant_local_date(monkeypatch: Any) -> None:
@@ -849,3 +856,197 @@ def test_billing_period_cost_sensor_fallbacks() -> None:
         service,
     )
     assert entity.native_value == 4.2
+    assert entity.last_reset is None
+
+
+def test_energy_dashboard_sensors_and_external_statistics() -> None:
+    """Test Energy Dashboard usage, solar export, cost, and solar credit sensors and external stats."""
+    service = {"accountServiceId": 1, "serviceType": "Power", "siteIdentifier": "NMI-1"}
+    gas_service = {
+        "accountServiceId": 2,
+        "serviceType": "Gas",
+        "siteIdentifier": "MIRN-1",
+    }
+
+    class FakeCoordinator:
+        data = {
+            "last_update": 1700000000.0,
+            "dashboard": {
+                "data": {"lastestInvoice": {"issuedDate": "2026-09-01T00:00:00"}}
+            },
+            "accounts": [
+                {"accountId": 10, "accountNumber": "ACC-10", "service_count": 2}
+            ],
+            "services": [service, gas_service],
+            "service_data": {
+                "1": {
+                    "service": service,
+                    "usage_summary": {
+                        "total_usage": 120.5,
+                        "latest_day": "2026-09-27",
+                        "latest_day_usage": 14.2,
+                        "daily": [{"readDate": "2026-09-27", "usage": 14.2}],
+                        "total_export": 45.0,
+                        "latest_day_export": 6.5,
+                        "export_daily": [{"readDate": "2026-09-27", "usage": 6.5}],
+                        "registers": [],
+                    },
+                    "cost_summary": {
+                        "total_amount": 32.10,
+                        "total_import_cost": 36.10,
+                        "total_export_credit": 4.00,
+                        "latest_day": "2026-09-27",
+                        "latest_day_amount": 3.50,
+                        "latest_day_import_cost": 4.00,
+                        "latest_day_export_credit": 0.50,
+                        "daily_totals": [{"date": "2026-09-27", "amount": 3.50}],
+                        "daily_export_credit_totals": [
+                            {"date": "2026-09-27", "amount": 0.50}
+                        ],
+                    },
+                },
+                "2": {
+                    "service": gas_service,
+                    "gas_reading_summary": {
+                        "latest_reading": 250.0,
+                        "latest_reading_date": "2026-09-26",
+                        "latest_reading_source": "Basic",
+                        "latest_reading_serial": "G1",
+                        "latest_reading_quality_method": "Actual",
+                        "history": [],
+                    },
+                    "cost_summary": {
+                        "total_amount": 18.00,
+                        "latest_day": "2026-09-26",
+                        "latest_day_amount": 1.20,
+                        "daily_totals": [{"date": "2026-09-26", "amount": 1.20}],
+                    },
+                },
+            },
+        }
+
+    recorder_statistics = types.ModuleType(
+        "homeassistant.components.recorder.statistics"
+    )
+    uploaded: list[tuple[Any, Any]] = []
+
+    async def add_ok(_hass: Any, meta: Any, stats: Any) -> None:
+        uploaded.append((meta, stats))
+
+    recorder_statistics.async_add_external_statistics = add_ok
+    sys.modules["homeassistant.components.recorder.statistics"] = recorder_statistics
+
+    entry = types.SimpleNamespace(entry_id="entry-1", runtime_data=FakeCoordinator())
+    added_entities: list[Any] = []
+    asyncio.run(
+        sensor.async_setup_entry(
+            types.SimpleNamespace(data={sensor.DOMAIN: {"entry-1": FakeCoordinator()}}),
+            entry,
+            added_entities.extend,
+        )
+    )
+    assert len(added_entities) >= 25
+
+    for ent in added_entities:
+        ent.hass = types.SimpleNamespace(
+            async_create_task=lambda coro: asyncio.run(coro)
+        )
+        _ = ent.native_value
+        _ = ent.extra_state_attributes
+        if hasattr(ent, "last_reset"):
+            _ = ent.last_reset
+        asyncio.run(ent.async_added_to_hass())
+        ent._handle_coordinator_update()
+
+    assert len(uploaded) >= 4
+
+    # Test external statistics error handling and empty/invalid rows
+    assert (
+        sensor._build_daily_cumulative_statistics(
+            ["not-a-dict", {"date": "invalid", "amount": 1.0}],
+            date_key="date",
+            value_key="amount",
+            tzinfo=UTC,
+        )
+        == []
+    )
+
+    async def add_err(_hass: Any, _meta: Any, _stats: Any) -> None:
+        raise RuntimeError("db error")
+
+    recorder_statistics.async_add_external_statistics = add_err
+    usage_sensor = sensor.GloBirdUsageTotalSensor(FakeCoordinator(), entry, service)
+    usage_sensor.hass = types.SimpleNamespace()
+    asyncio.run(usage_sensor._async_upload_statistics())
+
+    # Test global summary vs raw fallback functions
+    raw_data = {
+        "balance": {
+            "data": {
+                "balance": 10.0,
+                "maxRefundableAmount": 5.0,
+                "showRefundableAmount": True,
+            }
+        },
+        "dashboard": {
+            "data": {
+                "currentBalance": 20.0,
+                "accountId": 1,
+                "accountNumber": "A1",
+                "lastestInvoice": {"amount": 50.0},
+                "recentAccountTransactions": [{"id": 1}],
+            }
+        },
+        "signup_info": {"data": [{"id": 1}]},
+        "last_update": "bad-timestamp",
+    }
+    assert sensor._balance_value(raw_data) == -10.0
+    assert sensor._balance_attrs(raw_data)["max_refundable_amount"] == 5.0
+    assert sensor._dashboard_balance_value(raw_data) == -20.0
+    assert sensor._dashboard_attrs(raw_data)["account_id"] == 1
+    assert sensor._latest_invoice_value(raw_data) == 50.0
+    assert sensor._latest_invoice_attrs(raw_data)["amount"] == 50.0
+    assert sensor._signup_services_value(raw_data) == 1
+    assert len(sensor._signup_services_attrs(raw_data)["signup_info"]) == 1
+    assert sensor._timestamp_value("bad-timestamp") is None
+    assert sensor._refresh_status_value({"refresh_error": "boom"}) == "error"
+    assert (
+        sensor._refresh_status_attrs({"refresh_error": "boom"})["refresh_error"]
+        == "boom"
+    )
+
+    summary_data = {
+        "global_summary": {
+            "balance": -12.3,
+            "max_refundable_amount": 3.0,
+            "show_refundable_amount": False,
+            "dashboard_balance": -4.5,
+            "dashboard": {"account_id": 99},
+            "latest_invoice_amount": 88.0,
+            "latest_invoice": {"amount": 88.0},
+            "signup_services": 2,
+            "signup_info": [{"id": 1}, {"id": 2}],
+            "refresh_status": "ok",
+            "last_successful_refresh": 1700000000.0,
+            "last_failed_refresh": None,
+            "refresh_error": None,
+            "fetch_errors": {},
+        }
+    }
+    assert sensor._balance_value(summary_data) == -12.3
+    assert sensor._balance_attrs(summary_data)["max_refundable_amount"] == 3.0
+    assert sensor._dashboard_balance_value(summary_data) == -4.5
+    assert sensor._dashboard_attrs(summary_data)["account_id"] == 99
+    assert sensor._latest_invoice_value(summary_data) == 88.0
+    assert sensor._latest_invoice_attrs(summary_data)["amount"] == 88.0
+    assert sensor._signup_services_value(summary_data) == 2
+    assert len(sensor._signup_services_attrs(summary_data)["signup_info"]) == 2
+    assert sensor._refresh_status_value(summary_data) == "ok"
+    assert sensor._refresh_status_attrs(summary_data)["refresh_error"] is None
+    assert sensor._parse_portal_day("   ") is None
+    assert sensor._day_reset_timestamp(None) is None
+    assert sensor._billing_period_completed_days({}) is None
+    assert sensor._service_name_suffix({}) == "unknown"
+    assert sensor._safe_statistic_id("!!!", "!!!") == "service"
+    assert sensor._safe_statistic_id("", "123") == "svc_123"
+    assert sensor._build_gas_statistics([], tzinfo=UTC) == []

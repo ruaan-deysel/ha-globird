@@ -52,10 +52,11 @@ integration_init = importlib.import_module("custom_components.globird.__init__")
 
 
 class FakeConfigEntries:
-    def __init__(self) -> None:
+    def __init__(self, *, unload_ok: bool = True) -> None:
         self.forwarded: tuple[Any, Any] | None = None
         self.unloaded: tuple[Any, Any] | None = None
         self.reloaded: str | None = None
+        self._unload_ok = unload_ok
 
     async def async_forward_entry_setups(
         self, entry: Any, platforms: list[str]
@@ -64,16 +65,16 @@ class FakeConfigEntries:
 
     async def async_unload_platforms(self, entry: Any, platforms: list[str]) -> bool:
         self.unloaded = (entry, platforms)
-        return True
+        return self._unload_ok
 
     async def async_reload(self, entry_id: str) -> None:
         self.reloaded = entry_id
 
 
 class FakeHass:
-    def __init__(self) -> None:
+    def __init__(self, *, unload_ok: bool = True) -> None:
         self.data: dict[str, Any] = {}
-        self.config_entries = FakeConfigEntries()
+        self.config_entries = FakeConfigEntries(unload_ok=unload_ok)
 
 
 class FakeCoordinator:
@@ -92,6 +93,7 @@ class FakeEntry:
     def __init__(self) -> None:
         self.entry_id = "entry-1"
         self.listener = None
+        self.runtime_data: Any = None
 
     def add_update_listener(self, listener: Any) -> Any:
         self.listener = listener
@@ -112,6 +114,7 @@ def test_async_setup_and_unload_entry(monkeypatch: Any) -> None:
 
     assert result is True
     coordinator = hass.data[integration_init.DOMAIN][entry.entry_id]
+    assert entry.runtime_data is coordinator
     assert isinstance(coordinator, FakeCoordinator)
     assert coordinator.refreshed is True
     assert hass.config_entries.forwarded is not None
@@ -119,6 +122,18 @@ def test_async_setup_and_unload_entry(monkeypatch: Any) -> None:
     unload_result = asyncio.run(integration_init.async_unload_entry(hass, entry))
     assert unload_result is True
     assert coordinator.shutdown is True
+
+
+def test_async_unload_entry_handles_failed_platform_unload_and_missing_coordinator() -> (
+    None
+):
+    """Unload returns False when platform unload fails and handles missing coordinator."""
+    hass_fail = FakeHass(unload_ok=False)
+    entry = FakeEntry()
+    assert asyncio.run(integration_init.async_unload_entry(hass_fail, entry)) is False
+
+    hass_empty = FakeHass(unload_ok=True)
+    assert asyncio.run(integration_init.async_unload_entry(hass_empty, entry)) is True
 
 
 def test_async_update_options_triggers_reload() -> None:

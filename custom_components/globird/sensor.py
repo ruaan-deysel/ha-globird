@@ -1,4 +1,4 @@
-"""Sensor entities for GloBird"""
+"""Sensor entities for GloBird."""
 
 from __future__ import annotations
 
@@ -11,22 +11,31 @@ from datetime import time as dt_time
 from inspect import isawaitable
 from typing import Any
 
-from homeassistant.components.recorder.models import StatisticMeanType
+from homeassistant.components.recorder.models import (
+    StatisticData,
+    StatisticMeanType,
+    StatisticMetaData,
+)
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import UnitOfEnergy, UnitOfTemperature, UnitOfVolume
+from homeassistant.const import (
+    EntityCategory,
+    UnitOfEnergy,
+    UnitOfTemperature,
+    UnitOfVolume,
+)
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_point_in_time
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
-from homeassistant.util.unit_conversion import VolumeConverter
+from homeassistant.util.unit_conversion import EnergyConverter, VolumeConverter
 
-from .api import (
+from .client import (
     build_billing_period_projection,
     build_latest_data_status,
     cost_attributes,
@@ -36,15 +45,17 @@ from .api import (
 from .const import DOMAIN
 from .coordinator import GloBirdCoordinator
 
+PARALLEL_UPDATES = 0
+
 CURRENCY_AUD = "AUD"
 _LOGGER = logging.getLogger(__name__)
-ZEROHERO_STATUS_OPTIONS = (
+ZEROHERO_STATUS_OPTIONS: list[str] = [
     "achieved",
     "missed",
     "pending",
     "awaiting_result",
     "unknown",
-)
+]
 ZEROHERO_RESULT_CUTOFF = dt_time(hour=21)
 
 
@@ -197,6 +208,15 @@ def _parse_portal_day(value: Any) -> date | None:
         return None
 
 
+def _day_reset_timestamp(value: Any) -> datetime | None:
+    """Return midnight in local timezone for a portal day string (used for last_reset)."""
+    parsed = _parse_portal_day(value)
+    if parsed is None:
+        return None
+    tzinfo = dt_util.now().tzinfo or UTC
+    return datetime.combine(parsed, dt_time.min, tzinfo=tzinfo)
+
+
 def _billing_period_completed_days(
     data: dict[str, Any],
     today: date | None = None,
@@ -305,6 +325,42 @@ def _build_gas_statistics(
     return [by_day[day] for day in sorted(by_day)]
 
 
+def _build_daily_cumulative_statistics(
+    daily_rows: list[dict[str, Any]],
+    *,
+    date_key: str,
+    value_key: str,
+    tzinfo: Any,
+) -> list[dict[str, Any]]:
+    """Build cumulative daily statistics for Energy Dashboard consumption or cost."""
+    by_day: dict[date, float] = {}
+    for row in daily_rows:
+        if not isinstance(row, dict):
+            continue
+        parsed_day = _parse_portal_day(row.get(date_key))
+        raw_val = row.get(value_key)
+        if parsed_day is None or not isinstance(raw_val, (int, float)):
+            continue
+        by_day[parsed_day] = by_day.get(parsed_day, 0.0) + float(raw_val)
+
+    if not by_day:
+        return []
+
+    cumulative_sum = 0.0
+    result: list[dict[str, Any]] = []
+    for day in sorted(by_day):
+        day_value = round(by_day[day], 3)
+        cumulative_sum = round(cumulative_sum + day_value, 3)
+        result.append(
+            {
+                "start": datetime.combine(day, dt_time.min, tzinfo=tzinfo),
+                "state": day_value,
+                "sum": cumulative_sum,
+            }
+        )
+    return result
+
+
 def _zerohero_last_result(
     summary: dict[str, Any],
 ) -> tuple[str, date | None, str | None]:
@@ -382,6 +438,7 @@ class GloBirdSensorDescription:
     native_unit_of_measurement: str | None = None
     device_class: SensorDeviceClass | None = None
     state_class: SensorStateClass | None = None
+    entity_category: EntityCategory | None = None
     icon: str | None = None
 
 
@@ -393,6 +450,7 @@ GLOBAL_SENSORS: tuple[GloBirdSensorDescription, ...] = (
         attrs_fn=_balance_attrs,
         native_unit_of_measurement=CURRENCY_AUD,
         device_class=SensorDeviceClass.MONETARY,
+        state_class=SensorStateClass.TOTAL,
         icon="mdi:cash",
     ),
     GloBirdSensorDescription(
@@ -402,6 +460,7 @@ GLOBAL_SENSORS: tuple[GloBirdSensorDescription, ...] = (
         attrs_fn=_dashboard_attrs,
         native_unit_of_measurement=CURRENCY_AUD,
         device_class=SensorDeviceClass.MONETARY,
+        state_class=SensorStateClass.TOTAL,
         icon="mdi:view-dashboard",
     ),
     GloBirdSensorDescription(
@@ -418,6 +477,7 @@ GLOBAL_SENSORS: tuple[GloBirdSensorDescription, ...] = (
         name="Signup Services",
         value_fn=_signup_services_value,
         attrs_fn=_signup_services_attrs,
+        entity_category=EntityCategory.DIAGNOSTIC,
         icon="mdi:transmission-tower",
     ),
     GloBirdSensorDescription(
@@ -425,6 +485,7 @@ GLOBAL_SENSORS: tuple[GloBirdSensorDescription, ...] = (
         name="Last Successful Refresh",
         value_fn=_last_successful_refresh_value,
         device_class=SensorDeviceClass.TIMESTAMP,
+        entity_category=EntityCategory.DIAGNOSTIC,
         icon="mdi:update",
     ),
     GloBirdSensorDescription(
@@ -432,6 +493,7 @@ GLOBAL_SENSORS: tuple[GloBirdSensorDescription, ...] = (
         name="Refresh Status",
         value_fn=_refresh_status_value,
         attrs_fn=_refresh_status_attrs,
+        entity_category=EntityCategory.DIAGNOSTIC,
         icon="mdi:cloud-refresh",
     ),
 )
@@ -443,7 +505,10 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up GloBird sensors from a config entry."""
-    coordinator: GloBirdCoordinator = hass.data[DOMAIN][config_entry.entry_id]
+    coordinator: GloBirdCoordinator = (
+        getattr(config_entry, "runtime_data", None)
+        or hass.data[DOMAIN][config_entry.entry_id]
+    )
     data = coordinator.data or {}
 
     entities: list[SensorEntity] = [
@@ -463,12 +528,23 @@ async def async_setup_entry(
         if _is_gas_service(service):
             service_entities.extend(
                 [
+                    GloBirdLatestDataDateSensor(coordinator, config_entry, service),
+                    GloBirdLatestDataStatusSensor(coordinator, config_entry, service),
                     GloBirdLatestGasReadingSensor(coordinator, config_entry, service),
                     GloBirdLatestGasReadingDateSensor(
                         coordinator,
                         config_entry,
                         service,
                     ),
+                    GloBirdCostTotalSensor(coordinator, config_entry, service),
+                    GloBirdLatestDayCostSensor(coordinator, config_entry, service),
+                    GloBirdExpectedMonthlyCostSensor(
+                        coordinator,
+                        config_entry,
+                        service,
+                    ),
+                    GloBirdBillingPeriodDaysSensor(coordinator, config_entry, service),
+                    GloBirdBillingPeriodCostSensor(coordinator, config_entry, service),
                 ]
             )
         else:
@@ -486,6 +562,16 @@ async def async_setup_entry(
                     ),
                     GloBirdCostTotalSensor(coordinator, config_entry, service),
                     GloBirdLatestDayCostSensor(coordinator, config_entry, service),
+                    GloBirdSolarExportCreditTotalSensor(
+                        coordinator,
+                        config_entry,
+                        service,
+                    ),
+                    GloBirdLatestDaySolarExportCreditSensor(
+                        coordinator,
+                        config_entry,
+                        service,
+                    ),
                     GloBirdZeroHeroStatusSensor(coordinator, config_entry, service),
                     GloBirdExpectedMonthlyCostSensor(
                         coordinator,
@@ -528,11 +614,13 @@ class GloBirdGlobalSensor(GloBirdBaseSensor):
         """Initialize the sensor."""
         super().__init__(coordinator, config_entry)
         self._description = description
+        self._attr_translation_key = description.key
         self._attr_name = description.name
         self._attr_unique_id = f"{config_entry.entry_id}_{description.key}"
         self._attr_native_unit_of_measurement = description.native_unit_of_measurement
         self._attr_device_class = description.device_class
         self._attr_state_class = description.state_class
+        self._attr_entity_category = description.entity_category
         self._attr_icon = description.icon
         self._attr_device_info = {
             "identifiers": {(DOMAIN, config_entry.entry_id)},
@@ -565,8 +653,10 @@ class GloBirdAccountSummarySensor(GloBirdBaseSensor):
         """Initialize the sensor."""
         super().__init__(coordinator, config_entry)
         self._account_id = str(account.get("accountId") or account.get("accountNumber"))
+        self._attr_translation_key = "account_summary"
         self._attr_name = f"Account {account.get('accountNumber') or self._account_id}"
         self._attr_icon = "mdi:account"
+        self._attr_entity_category = EntityCategory.DIAGNOSTIC
         self._attr_unique_id = (
             f"{config_entry.entry_id}_account_{self._account_id}_summary"
         )
@@ -599,12 +689,13 @@ class GloBirdAccountSummarySensor(GloBirdBaseSensor):
 class GloBirdServiceBaseSensor(GloBirdBaseSensor):
     """Base class for service-level sensors."""
 
-    sensor_key = "service"
-    sensor_name = "Service"
-    icon = "mdi:flash"
-    native_unit_of_measurement: str | None = None
-    device_class: SensorDeviceClass | None = None
-    state_class: SensorStateClass | None = None
+    sensor_key: str = "service"
+    sensor_name: str = "Service"
+    sensor_icon: str | None = "mdi:flash"
+    sensor_unit: str | None = None
+    sensor_device_class: SensorDeviceClass | None = None
+    sensor_state_class: SensorStateClass | None = None
+    sensor_entity_category: EntityCategory | None = None
 
     def __init__(
         self,
@@ -615,6 +706,7 @@ class GloBirdServiceBaseSensor(GloBirdBaseSensor):
         """Initialize the sensor."""
         super().__init__(coordinator, config_entry)
         self._service_id = service_id(service)
+        self._attr_translation_key = self.sensor_key
         if _is_gas_service(service):
             self._attr_name = f"{self.sensor_name} ({_service_name_suffix(service)})"
         else:
@@ -622,10 +714,11 @@ class GloBirdServiceBaseSensor(GloBirdBaseSensor):
         self._attr_unique_id = (
             f"{config_entry.entry_id}_service_{self._service_id}_{self.sensor_key}"
         )
-        self._attr_icon = self.icon
-        self._attr_native_unit_of_measurement = self.native_unit_of_measurement
-        self._attr_device_class = self.device_class
-        self._attr_state_class = self.state_class
+        self._attr_icon = self.sensor_icon
+        self._attr_native_unit_of_measurement = self.sensor_unit
+        self._attr_device_class = self.sensor_device_class
+        self._attr_state_class = self.sensor_state_class
+        self._attr_entity_category = self.sensor_entity_category
         self._attr_device_info = {
             "identifiers": {(DOMAIN, config_entry.entry_id)},
             "name": "GloBird Energy",
@@ -653,13 +746,74 @@ class GloBirdServiceBaseSensor(GloBirdBaseSensor):
             "account_number": service.get("accountNumber"),
         }
 
+    async def _async_upload_daily_external_statistics(
+        self,
+        daily_rows: list[dict[str, Any]],
+        *,
+        date_key: str,
+        value_key: str,
+        unit_class: str | None,
+    ) -> None:
+        """Upload daily cumulative external statistics for the Home Assistant Energy Dashboard."""
+        if not isinstance(daily_rows, list) or not daily_rows:
+            return
+
+        try:
+            from homeassistant.components.recorder.statistics import (
+                async_add_external_statistics,
+            )
+        except ImportError:
+            return
+
+        statistics = [
+            StatisticData(**row)
+            for row in _build_daily_cumulative_statistics(
+                daily_rows,
+                date_key=date_key,
+                value_key=value_key,
+                tzinfo=dt_util.now().tzinfo or UTC,
+            )
+        ]
+        if not statistics:
+            return
+
+        statistic_suffix = _safe_statistic_id(
+            getattr(self, "_attr_unique_id", self._service_id),
+            self._service_id,
+        )
+        statistic_id = f"{DOMAIN}:{statistic_suffix}"
+        metadata = StatisticMetaData(
+            has_mean=False,
+            mean_type=StatisticMeanType.NONE,
+            has_sum=True,
+            name=self._attr_name,
+            source=DOMAIN,
+            statistic_id=statistic_id,
+            unit_class=unit_class,
+            unit_of_measurement=self._attr_native_unit_of_measurement,
+        )
+        try:
+            add_result: Any = async_add_external_statistics(
+                self.hass, metadata, statistics
+            )
+            if isawaitable(add_result):
+                await add_result
+        except Exception as err:
+            _LOGGER.warning(
+                "GloBird external statistics import skipped for %s (%s): %s",
+                self._service_id,
+                statistic_id,
+                err,
+            )
+
 
 class GloBirdServiceStatusSensor(GloBirdServiceBaseSensor):
     """Service status sensor."""
 
     sensor_key = "service_status"
     sensor_name = "Service Status"
-    icon = "mdi:transmission-tower"
+    sensor_icon = "mdi:transmission-tower"
+    sensor_entity_category = EntityCategory.DIAGNOSTIC
 
     @property
     def native_value(self) -> Any:
@@ -682,7 +836,8 @@ class GloBirdMeterInfoSensor(GloBirdServiceBaseSensor):
 
     sensor_key = "meter_info"
     sensor_name = "Meter Info"
-    icon = "mdi:counter"
+    sensor_icon = "mdi:counter"
+    sensor_entity_category = EntityCategory.DIAGNOSTIC
 
     @property
     def native_value(self) -> Any:
@@ -703,7 +858,8 @@ class GloBirdLatestDataDateSensor(GloBirdServiceBaseSensor):
 
     sensor_key = "latest_data_date"
     sensor_name = "Latest Data Date"
-    icon = "mdi:calendar-check"
+    sensor_icon = "mdi:calendar-check"
+    sensor_entity_category = EntityCategory.DIAGNOSTIC
 
     @property
     def native_value(self) -> Any:
@@ -741,7 +897,8 @@ class GloBirdLatestDataStatusSensor(GloBirdServiceBaseSensor):
 
     sensor_key = "latest_data_status"
     sensor_name = "Latest Data Status"
-    icon = "mdi:calendar-sync"
+    sensor_icon = "mdi:calendar-sync"
+    sensor_entity_category = EntityCategory.DIAGNOSTIC
 
     @property
     def native_value(self) -> Any:
@@ -775,10 +932,10 @@ class GloBirdLatestGasReadingSensor(GloBirdServiceBaseSensor):
 
     sensor_key = "latest_gas_reading"
     sensor_name = "Latest Gas Reading"
-    icon = "mdi:meter-gas"
-    native_unit_of_measurement = UnitOfVolume.CUBIC_METERS
-    device_class = SensorDeviceClass.GAS
-    state_class = SensorStateClass.TOTAL_INCREASING
+    sensor_icon = "mdi:meter-gas"
+    sensor_unit = UnitOfVolume.CUBIC_METERS
+    sensor_device_class = SensorDeviceClass.GAS
+    sensor_state_class = SensorStateClass.TOTAL_INCREASING
 
     async def async_added_to_hass(self) -> None:
         """Upload historical gas readings to recorder long-term statistics."""
@@ -788,7 +945,8 @@ class GloBirdLatestGasReadingSensor(GloBirdServiceBaseSensor):
     def _handle_coordinator_update(self) -> None:
         """Refresh the entity and import any newly published gas reads."""
         super()._handle_coordinator_update()
-        self.hass.async_create_task(self._async_upload_historical_statistics())
+        if hasattr(self.hass, "async_create_task"):
+            self.hass.async_create_task(self._async_upload_historical_statistics())
 
     async def _async_upload_historical_statistics(self) -> None:
         """Import all historical gas meter reads as external statistics."""
@@ -804,8 +962,6 @@ class GloBirdLatestGasReadingSensor(GloBirdServiceBaseSensor):
 
         try:
             from homeassistant.components.recorder.statistics import (
-                StatisticData,
-                StatisticMetaData,
                 async_add_external_statistics,
             )
         except ImportError:
@@ -840,7 +996,7 @@ class GloBirdLatestGasReadingSensor(GloBirdServiceBaseSensor):
             source=DOMAIN,
             statistic_id=statistic_id,
             unit_class=VolumeConverter.UNIT_CLASS,
-            unit_of_measurement=self.native_unit_of_measurement,
+            unit_of_measurement=self._attr_native_unit_of_measurement,
         )
         _LOGGER.debug(
             "GloBird gas statistics prepared for %s (%s): %d rows from %s to %s",
@@ -851,7 +1007,9 @@ class GloBirdLatestGasReadingSensor(GloBirdServiceBaseSensor):
             statistics[-1]["start"].isoformat(),
         )
         try:
-            add_result = async_add_external_statistics(self.hass, metadata, statistics)
+            add_result: Any = async_add_external_statistics(
+                self.hass, metadata, statistics
+            )
             if isawaitable(add_result):
                 await add_result
         except Exception as err:
@@ -895,7 +1053,8 @@ class GloBirdLatestGasReadingDateSensor(GloBirdServiceBaseSensor):
 
     sensor_key = "latest_gas_reading_date"
     sensor_name = "Latest Gas Reading Date"
-    icon = "mdi:calendar-clock"
+    sensor_icon = "mdi:calendar-clock"
+    sensor_entity_category = EntityCategory.DIAGNOSTIC
 
     @property
     def native_value(self) -> Any:
@@ -923,14 +1082,35 @@ class GloBirdLatestGasReadingDateSensor(GloBirdServiceBaseSensor):
 
 
 class GloBirdUsageTotalSensor(GloBirdServiceBaseSensor):
-    """Recent usage total sensor."""
+    """Recent usage total sensor (supports HA Energy Dashboard grid consumption)."""
 
     sensor_key = "usage_total"
     sensor_name = "Recent Usage Total"
-    icon = "mdi:lightning-bolt"
-    native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
-    device_class = SensorDeviceClass.ENERGY
-    state_class = SensorStateClass.TOTAL
+    sensor_icon = "mdi:lightning-bolt"
+    sensor_unit = UnitOfEnergy.KILO_WATT_HOUR
+    sensor_device_class = SensorDeviceClass.ENERGY
+    sensor_state_class = SensorStateClass.TOTAL
+
+    async def async_added_to_hass(self) -> None:
+        """Upload historical daily usage to recorder long-term statistics."""
+        await super().async_added_to_hass()
+        await self._async_upload_statistics()
+
+    def _handle_coordinator_update(self) -> None:
+        """Refresh the entity and import newly published usage statistics."""
+        super()._handle_coordinator_update()
+        if hasattr(self.hass, "async_create_task"):
+            self.hass.async_create_task(self._async_upload_statistics())
+
+    async def _async_upload_statistics(self) -> None:
+        """Upload daily electricity import statistics."""
+        summary = self._service_detail().get("usage_summary") or {}
+        await self._async_upload_daily_external_statistics(
+            summary.get("daily") or [],
+            date_key="readDate",
+            value_key="usage",
+            unit_class=EnergyConverter.UNIT_CLASS,
+        )
 
     @property
     def native_value(self) -> Any:
@@ -947,14 +1127,20 @@ class GloBirdUsageTotalSensor(GloBirdServiceBaseSensor):
 
 
 class GloBirdLatestDayUsageSensor(GloBirdServiceBaseSensor):
-    """Latest day usage sensor."""
+    """Latest day usage sensor (supports HA Energy Dashboard with daily last_reset)."""
 
     sensor_key = "latest_day_usage"
     sensor_name = "Latest Day Usage"
-    icon = "mdi:calendar-today"
-    native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
-    device_class = SensorDeviceClass.ENERGY
-    state_class = SensorStateClass.TOTAL
+    sensor_icon = "mdi:calendar-today"
+    sensor_unit = UnitOfEnergy.KILO_WATT_HOUR
+    sensor_device_class = SensorDeviceClass.ENERGY
+    sensor_state_class = SensorStateClass.TOTAL
+
+    @property
+    def last_reset(self) -> datetime | None:
+        """Return midnight of the latest day so Recorder resets daily totals cleanly."""
+        summary = self._service_detail().get("usage_summary") or {}
+        return _day_reset_timestamp(summary.get("latest_day"))
 
     @property
     def native_value(self) -> Any:
@@ -979,14 +1165,35 @@ class GloBirdLatestDayUsageSensor(GloBirdServiceBaseSensor):
 
 
 class GloBirdSolarExportTotalSensor(GloBirdServiceBaseSensor):
-    """Recent solar export total sensor (B1 register)."""
+    """Recent solar export total sensor (B1 register, supports Energy Dashboard Return to Grid)."""
 
     sensor_key = "solar_export_total"
     sensor_name = "Recent Solar Export Total"
-    icon = "mdi:solar-power"
-    native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
-    device_class = SensorDeviceClass.ENERGY
-    state_class = SensorStateClass.TOTAL
+    sensor_icon = "mdi:solar-power"
+    sensor_unit = UnitOfEnergy.KILO_WATT_HOUR
+    sensor_device_class = SensorDeviceClass.ENERGY
+    sensor_state_class = SensorStateClass.TOTAL
+
+    async def async_added_to_hass(self) -> None:
+        """Upload historical daily solar export to recorder long-term statistics."""
+        await super().async_added_to_hass()
+        await self._async_upload_statistics()
+
+    def _handle_coordinator_update(self) -> None:
+        """Refresh the entity and import newly published solar export statistics."""
+        super()._handle_coordinator_update()
+        if hasattr(self.hass, "async_create_task"):
+            self.hass.async_create_task(self._async_upload_statistics())
+
+    async def _async_upload_statistics(self) -> None:
+        """Upload daily solar export statistics."""
+        summary = self._service_detail().get("usage_summary") or {}
+        await self._async_upload_daily_external_statistics(
+            summary.get("export_daily") or [],
+            date_key="readDate",
+            value_key="usage",
+            unit_class=EnergyConverter.UNIT_CLASS,
+        )
 
     @property
     def native_value(self) -> Any:
@@ -1007,10 +1214,22 @@ class GloBirdLatestDaySolarExportSensor(GloBirdServiceBaseSensor):
 
     sensor_key = "latest_day_solar_export"
     sensor_name = "Latest Day Solar Export"
-    icon = "mdi:solar-power-variant"
-    native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
-    device_class = SensorDeviceClass.ENERGY
-    state_class = SensorStateClass.TOTAL
+    sensor_icon = "mdi:solar-power-variant"
+    sensor_unit = UnitOfEnergy.KILO_WATT_HOUR
+    sensor_device_class = SensorDeviceClass.ENERGY
+    sensor_state_class = SensorStateClass.TOTAL
+
+    @property
+    def last_reset(self) -> datetime | None:
+        """Return midnight of the latest export day so Recorder resets daily totals cleanly."""
+        summary = self._service_detail().get("usage_summary") or {}
+        export_daily = summary.get("export_daily") or []
+        latest_day = (
+            export_daily[-1].get("readDate")
+            if export_daily and isinstance(export_daily[-1], dict)
+            else summary.get("latest_day")
+        )
+        return _day_reset_timestamp(latest_day)
 
     @property
     def native_value(self) -> Any:
@@ -1029,14 +1248,35 @@ class GloBirdLatestDaySolarExportSensor(GloBirdServiceBaseSensor):
 
 
 class GloBirdCostTotalSensor(GloBirdServiceBaseSensor):
-    """Recent cost total sensor."""
+    """Recent cost total sensor (compatible with HA Energy Dashboard total cost tracking)."""
 
     sensor_key = "cost_total"
     sensor_name = "Recent Cost Total"
-    icon = "mdi:cash-multiple"
-    native_unit_of_measurement = CURRENCY_AUD
-    device_class = SensorDeviceClass.MONETARY
-    state_class = None
+    sensor_icon = "mdi:cash-multiple"
+    sensor_unit = CURRENCY_AUD
+    sensor_device_class = SensorDeviceClass.MONETARY
+    sensor_state_class = SensorStateClass.TOTAL
+
+    async def async_added_to_hass(self) -> None:
+        """Upload historical daily cost totals to recorder long-term statistics."""
+        await super().async_added_to_hass()
+        await self._async_upload_statistics()
+
+    def _handle_coordinator_update(self) -> None:
+        """Refresh the entity and import newly published cost statistics."""
+        super()._handle_coordinator_update()
+        if hasattr(self.hass, "async_create_task"):
+            self.hass.async_create_task(self._async_upload_statistics())
+
+    async def _async_upload_statistics(self) -> None:
+        """Upload daily cost statistics."""
+        summary = self._service_detail().get("cost_summary") or {}
+        await self._async_upload_daily_external_statistics(
+            summary.get("daily_totals") or [],
+            date_key="date",
+            value_key="amount",
+            unit_class=None,
+        )
 
     @property
     def native_value(self) -> Any:
@@ -1053,14 +1293,20 @@ class GloBirdCostTotalSensor(GloBirdServiceBaseSensor):
 
 
 class GloBirdLatestDayCostSensor(GloBirdServiceBaseSensor):
-    """Latest daily cost sensor."""
+    """Latest daily cost sensor (compatible with HA Energy Dashboard total cost tracking)."""
 
     sensor_key = "latest_day_cost"
     sensor_name = "Latest Daily Cost"
-    icon = "mdi:calendar-today"
-    native_unit_of_measurement = CURRENCY_AUD
-    device_class = SensorDeviceClass.MONETARY
-    state_class = None
+    sensor_icon = "mdi:calendar-today"
+    sensor_unit = CURRENCY_AUD
+    sensor_device_class = SensorDeviceClass.MONETARY
+    sensor_state_class = SensorStateClass.TOTAL
+
+    @property
+    def last_reset(self) -> datetime | None:
+        """Return midnight of the latest complete cost day."""
+        summary = self._service_detail().get("cost_summary") or {}
+        return _day_reset_timestamp(summary.get("latest_day"))
 
     @property
     def native_value(self) -> Any:
@@ -1077,6 +1323,8 @@ class GloBirdLatestDayCostSensor(GloBirdServiceBaseSensor):
         attrs.update(
             {
                 "latest_day": summary.get("latest_day"),
+                "latest_day_import_cost": summary.get("latest_day_import_cost"),
+                "latest_day_export_credit": summary.get("latest_day_export_credit"),
                 "latest_available_day": summary.get("latest_available_day"),
                 "latest_available_day_complete": summary.get(
                     "latest_available_day_complete"
@@ -1087,13 +1335,94 @@ class GloBirdLatestDayCostSensor(GloBirdServiceBaseSensor):
         return attrs
 
 
+class GloBirdSolarExportCreditTotalSensor(GloBirdServiceBaseSensor):
+    """Recent solar export compensation total sensor for the HA Energy Dashboard."""
+
+    sensor_key = "solar_export_credit_total"
+    sensor_name = "Recent Solar Export Credit Total"
+    sensor_icon = "mdi:cash-plus"
+    sensor_unit = CURRENCY_AUD
+    sensor_device_class = SensorDeviceClass.MONETARY
+    sensor_state_class = SensorStateClass.TOTAL
+
+    async def async_added_to_hass(self) -> None:
+        """Upload historical daily solar export credits to recorder long-term statistics."""
+        await super().async_added_to_hass()
+        await self._async_upload_statistics()
+
+    def _handle_coordinator_update(self) -> None:
+        """Refresh the entity and import newly published solar credit statistics."""
+        super()._handle_coordinator_update()
+        if hasattr(self.hass, "async_create_task"):
+            self.hass.async_create_task(self._async_upload_statistics())
+
+    async def _async_upload_statistics(self) -> None:
+        """Upload daily solar export credit statistics."""
+        summary = self._service_detail().get("cost_summary") or {}
+        await self._async_upload_daily_external_statistics(
+            summary.get("daily_export_credit_totals") or [],
+            date_key="date",
+            value_key="amount",
+            unit_class=None,
+        )
+
+    @property
+    def native_value(self) -> Any:
+        """Return total recent solar export compensation in AUD."""
+        return (self._service_detail().get("cost_summary") or {}).get(
+            "total_export_credit"
+        )
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return solar export credit attributes."""
+        attrs = self._service_attrs()
+        summary = self._service_detail().get("cost_summary") or {}
+        attrs["latest_day"] = summary.get("latest_day")
+        attrs["latest_day_export_credit"] = summary.get("latest_day_export_credit")
+        return attrs
+
+
+class GloBirdLatestDaySolarExportCreditSensor(GloBirdServiceBaseSensor):
+    """Latest daily solar export compensation sensor for the HA Energy Dashboard."""
+
+    sensor_key = "latest_day_solar_export_credit"
+    sensor_name = "Latest Daily Solar Export Credit"
+    sensor_icon = "mdi:cash-refund"
+    sensor_unit = CURRENCY_AUD
+    sensor_device_class = SensorDeviceClass.MONETARY
+    sensor_state_class = SensorStateClass.TOTAL
+
+    @property
+    def last_reset(self) -> datetime | None:
+        """Return midnight of the latest complete cost day."""
+        summary = self._service_detail().get("cost_summary") or {}
+        return _day_reset_timestamp(summary.get("latest_day"))
+
+    @property
+    def native_value(self) -> Any:
+        """Return latest day solar export compensation in AUD."""
+        return (self._service_detail().get("cost_summary") or {}).get(
+            "latest_day_export_credit"
+        )
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return latest daily solar export credit attributes."""
+        attrs = self._service_attrs()
+        summary = self._service_detail().get("cost_summary") or {}
+        attrs["latest_day"] = summary.get("latest_day")
+        attrs["total_export_credit"] = summary.get("total_export_credit")
+        return attrs
+
+
 class GloBirdZeroHeroStatusSensor(GloBirdServiceBaseSensor):
     """Local-day ZEROHERO credit status."""
 
     sensor_key = "zerohero_status"
     sensor_name = "ZeroHero Status"
-    icon = "mdi:check-decagram"
-    device_class = SensorDeviceClass.ENUM
+    sensor_icon = "mdi:check-decagram"
+    sensor_device_class = SensorDeviceClass.ENUM
     _attr_options = ZEROHERO_STATUS_OPTIONS
 
     def __init__(
@@ -1170,10 +1499,10 @@ class GloBirdExpectedMonthlyCostSensor(GloBirdServiceBaseSensor):
 
     sensor_key = "expected_month_cost"
     sensor_name = "Expected Monthly Cost"
-    icon = "mdi:cash-clock"
-    native_unit_of_measurement = CURRENCY_AUD
-    device_class = SensorDeviceClass.MONETARY
-    state_class = None
+    sensor_icon = "mdi:cash-clock"
+    sensor_unit = CURRENCY_AUD
+    sensor_device_class = SensorDeviceClass.MONETARY
+    sensor_state_class = None
 
     @property
     def native_value(self) -> Any:
@@ -1219,7 +1548,7 @@ class GloBirdBillingPeriodDaysSensor(GloBirdServiceBaseSensor):
 
     sensor_key = "billing_period_days"
     sensor_name = "Billing Period Days"
-    icon = "mdi:calendar-range"
+    sensor_icon = "mdi:calendar-range"
 
     @property
     def native_value(self) -> Any:
@@ -1244,13 +1573,23 @@ class GloBirdBillingPeriodDaysSensor(GloBirdServiceBaseSensor):
 
 
 class GloBirdBillingPeriodCostSensor(GloBirdServiceBaseSensor):
-    """Cost so far in the current billing period."""
+    """Cost so far in the current billing period (compatible with HA Energy Dashboard)."""
 
     sensor_key = "billing_period_cost"
     sensor_name = "Billing Period Cost"
-    icon = "mdi:cash-clock"
-    native_unit_of_measurement = CURRENCY_AUD
-    device_class = SensorDeviceClass.MONETARY
+    sensor_icon = "mdi:cash-clock"
+    sensor_unit = CURRENCY_AUD
+    sensor_device_class = SensorDeviceClass.MONETARY
+    sensor_state_class = SensorStateClass.TOTAL
+
+    @property
+    def last_reset(self) -> datetime | None:
+        """Return midnight on the billing period start date."""
+        start = _billing_period_start(self.coordinator.data or {})
+        if start is None:
+            return None
+        tzinfo = dt_util.now().tzinfo or UTC
+        return datetime.combine(start, dt_time.min, tzinfo=tzinfo)
 
     @property
     def native_value(self) -> Any:
@@ -1284,10 +1623,10 @@ class GloBirdWeatherSummarySensor(GloBirdServiceBaseSensor):
 
     sensor_key = "weather_summary"
     sensor_name = "Weather Summary"
-    icon = "mdi:weather-partly-cloudy"
-    native_unit_of_measurement = UnitOfTemperature.CELSIUS
-    device_class = SensorDeviceClass.TEMPERATURE
-    state_class = SensorStateClass.MEASUREMENT
+    sensor_icon = "mdi:weather-partly-cloudy"
+    sensor_unit = UnitOfTemperature.CELSIUS
+    sensor_device_class = SensorDeviceClass.TEMPERATURE
+    sensor_state_class = SensorStateClass.MEASUREMENT
 
     @property
     def native_value(self) -> Any:

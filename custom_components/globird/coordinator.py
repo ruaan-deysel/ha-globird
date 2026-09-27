@@ -1,4 +1,4 @@
-"""Data update coordinator for GloBird"""
+"""Data update coordinator for GloBird."""
 
 from __future__ import annotations
 
@@ -11,11 +11,13 @@ from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
-from .api import (
+from .client import (
+    GloBirdAuthError,
     GloBirdClient,
     all_services_ready_for_day,
     build_cost_summary,
@@ -94,10 +96,10 @@ class GloBirdCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.password = entry.data[CONF_PASSWORD]
         self.client = GloBirdClient()
 
-        self._cache_store = Store(
+        self._cache_store: Store[dict[str, Any]] = Store(
             hass, STORAGE_VERSION, f"{DOMAIN}.cache.{entry.entry_id}"
         )
-        self._cookie_store = Store(
+        self._cookie_store: Store[dict[str, Any]] = Store(
             hass, STORAGE_VERSION, f"{DOMAIN}.cookies.{entry.entry_id}"
         )
         self._cache: dict[str, Any] | None = None
@@ -316,6 +318,13 @@ class GloBirdCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             return data
 
+        except GloBirdAuthError as err:
+            self.update_interval = ACCOUNT_UPDATE_INTERVAL
+            raise ConfigEntryAuthFailed(
+                translation_domain=DOMAIN,
+                translation_key="auth_failed",
+                translation_placeholders={"error": str(err)},
+            ) from err
         except Exception as err:
             self.update_interval = ACCOUNT_UPDATE_INTERVAL
             if cache:

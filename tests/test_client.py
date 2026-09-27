@@ -25,8 +25,9 @@ globird_package.__path__ = [str(INTEGRATION_PATH)]  # type: ignore[attr-defined]
 sys.modules.setdefault("custom_components", custom_components)
 sys.modules.setdefault("custom_components.globird", globird_package)
 
-api = importlib.import_module("custom_components.globird.api")
-api_impl = importlib.import_module("custom_components.globird.api.api")
+api = importlib.import_module("custom_components.globird.client")
+api_impl = importlib.import_module("custom_components.globird.api.client")
+importlib.import_module("custom_components.globird.api")
 
 GloBirdCaptchaRequired = api.GloBirdCaptchaRequired
 GloBirdAuthError = api.GloBirdAuthError
@@ -1177,6 +1178,104 @@ def test_authenticate_login_failure_with_message() -> None:
     else:
         raise AssertionError("Expected auth error")
     assert client.is_authenticated is False
+
+
+def test_pydantic_models_and_client_additional_coverage() -> None:
+    """Test Pydantic v2 field validators, RSA JWK encryption, and client endpoint helpers."""
+    import base64
+
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    from custom_components.globird.api.models import (
+        UsageDailyRow,
+        _coerce_optional_float,
+    )
+
+    assert _coerce_optional_float(None) is None
+    assert _coerce_optional_float(True) is None
+    assert _coerce_optional_float(" 12.34 ") == 12.34
+    assert _coerce_optional_float("   ") is None
+    assert _coerce_optional_float("not-a-float") is None
+    assert _coerce_optional_float(["invalid"]) is None
+    row = UsageDailyRow.model_validate({"readDate": "2026-09-28", "usage": "4.5"})
+    assert row.usage == 4.5
+
+    # Generate an ephemeral RSA key to test _encrypt_password end-to-end
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pub_numbers = private_key.public_key().public_numbers()
+    n_bytes = pub_numbers.n.to_bytes((pub_numbers.n.bit_length() + 7) // 8, "big")
+    e_bytes = pub_numbers.e.to_bytes((pub_numbers.e.bit_length() + 7) // 8, "big")
+    jwk_payload = {
+        "n": base64.urlsafe_b64encode(n_bytes).decode("utf-8").rstrip("="),
+        "e": base64.urlsafe_b64encode(e_bytes).decode("utf-8").rstrip("="),
+    }
+
+    session = FakeSession(
+        [
+            (200, jwk_payload),
+            (200, {"data": {"user": 1}, "success": True}),
+            (200, {"data": {}, "success": True}),
+            (200, {"data": [], "success": True}),
+            (200, {"data": {"days": 2}, "success": True}),
+            (200, {"data": {"days": 3}, "success": True}),
+        ]
+    )
+    client = GloBirdClient(session=session, base_url="https://example.test")
+    encrypted = asyncio.run(client._encrypt_password("secret-pw"))
+    assert isinstance(encrypted, str) and len(encrypted) > 20
+
+    client.disable_reauth()
+    client.enable_reauth()
+    assert asyncio.run(client.get_current_user())["success"] is True
+    assert asyncio.run(client.get_account_service_status())["success"] is True
+    assert asyncio.run(client.get_power_meter_types(nmi="123"))["success"] is True
+    assert asyncio.run(client.get_weather_impacted_days())["success"] is True
+    assert (
+        asyncio.run(client.get_weather_impacted_days(account_id=42))["success"] is True
+    )
+
+    async def owned_session_lifecycle() -> None:
+        owned = GloBirdClient()
+        await owned.close()
+
+    asyncio.run(owned_session_lifecycle())
+
+    # Additional edge cases in select_meter_for_service, build_usage_summary, build_gas_reading_summary, and build_billing_period_projection
+    assert (
+        select_meter_for_service({"siteIdentifier": "NMI"}, {"data": "invalid"}) is None
+    )
+    assert (
+        select_meter_for_service({"siteIdentifier": "NMI"}, {"data": {"items": []}})
+        is None
+    )
+    assert build_usage_summary({"data": "not-a-list"})["days"] == 0
+    assert (
+        build_gas_reading_summary(
+            {
+                "data": {
+                    "src1": "not-a-list",
+                    "src2": ["not-a-dict", {"readIndex": None, "readDate": "bad"}],
+                }
+            }
+        )["history_count"]
+        == 0
+    )
+    assert build_cost_summary({"data": "not-a-list"})["days"] == 0
+    assert (
+        build_billing_period_projection(
+            ["not-a-dict", {"date": "2020-01-01", "amount": 5.0}],
+            date(2026, 1, 1),
+        )["completed_days"]
+        == 0
+    )
+    assert all_services_ready_for_day(None, date(2026, 1, 1)) is False
+    assert all_services_ready_for_day({"a": "not-dict"}, date(2026, 1, 1)) is False
+    assert (
+        all_services_ready_for_day(
+            {"a": {"latest_data_status": None}}, date(2026, 1, 1)
+        )
+        is False
+    )
 
 
 def load_tests(

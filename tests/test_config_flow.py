@@ -10,14 +10,14 @@ from pathlib import Path
 from typing import Any
 
 COMPONENT_PATH = Path(__file__).parents[1] / "custom_components"
-INTEGRATION_PATH = COMPONENT_PATH / "globird_ha"
+INTEGRATION_PATH = COMPONENT_PATH / "globird"
 
 custom_components = types.ModuleType("custom_components")
 custom_components.__path__ = [str(COMPONENT_PATH)]  # type: ignore[attr-defined]
-globird_package = types.ModuleType("custom_components.globird_ha")
+globird_package = types.ModuleType("custom_components.globird")
 globird_package.__path__ = [str(INTEGRATION_PATH)]  # type: ignore[attr-defined]
 sys.modules["custom_components"] = custom_components
-sys.modules["custom_components.globird_ha"] = globird_package
+sys.modules["custom_components.globird"] = globird_package
 
 voluptuous = types.ModuleType("voluptuous")
 homeassistant = types.ModuleType("homeassistant")
@@ -25,6 +25,8 @@ config_entries = types.ModuleType("homeassistant.config_entries")
 data_entry_flow = types.ModuleType("homeassistant.data_entry_flow")
 helpers = types.ModuleType("homeassistant.helpers")
 selector = types.ModuleType("homeassistant.helpers.selector")
+util = types.ModuleType("homeassistant.util")
+util_logging = types.ModuleType("homeassistant.util.logging")
 
 
 class Schema(dict):
@@ -103,9 +105,12 @@ selector.TextSelectorConfig = lambda **kwargs: kwargs
 selector.TextSelectorType = types.SimpleNamespace(PASSWORD="password")
 selector.TimeSelector = TimeSelector
 helpers.selector = selector
+util_logging.log_exception = lambda *_args, **_kwargs: None
+util.logging = util_logging
 homeassistant.config_entries = config_entries
 homeassistant.data_entry_flow = data_entry_flow
 homeassistant.helpers = helpers
+homeassistant.util = util
 
 sys.modules["homeassistant"] = homeassistant
 sys.modules["voluptuous"] = voluptuous
@@ -113,8 +118,10 @@ sys.modules["homeassistant.config_entries"] = config_entries
 sys.modules["homeassistant.data_entry_flow"] = data_entry_flow
 sys.modules["homeassistant.helpers"] = helpers
 sys.modules["homeassistant.helpers.selector"] = selector
+sys.modules["homeassistant.util"] = util
+sys.modules["homeassistant.util.logging"] = util_logging
 
-config_flow = importlib.import_module("custom_components.globird_ha.config_flow")
+config_flow = importlib.import_module("custom_components.globird.config_flow")
 
 
 def test_options_flow_is_created_without_manual_config_entry_assignment() -> None:
@@ -148,3 +155,87 @@ def test_options_flow_saves_daily_poll_start_time() -> None:
         "title": "",
         "data": {"daily_poll_start_time": "03:00"},
     }
+
+
+def test_user_step_creates_entry_on_valid_auth(monkeypatch: Any) -> None:
+    """Valid credentials should create a config entry."""
+
+    class FakeClient:
+        async def authenticate(self, _email: str, _password: str) -> dict[str, Any]:
+            return {"success": True}
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(config_flow, "GloBirdClient", lambda: FakeClient())
+
+    flow = config_flow.GloBirdConfigFlow()
+    result = asyncio.run(
+        flow.async_step_user(
+            {
+                "email": "user@example.test",
+                "password": "secret",
+            }
+        )
+    )
+
+    assert result["type"] == "create_entry"
+    assert result["title"] == "user@example.test"
+    assert result["data"]["email"] == "user@example.test"
+
+
+def test_user_step_maps_captcha_error(monkeypatch: Any) -> None:
+    """Captcha-required auth failures should map to the expected flow error."""
+
+    class FakeClient:
+        async def authenticate(self, _email: str, _password: str) -> dict[str, Any]:
+            raise config_flow.GloBirdCaptchaRequired()
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(config_flow, "GloBirdClient", lambda: FakeClient())
+
+    flow = config_flow.GloBirdConfigFlow()
+    result = asyncio.run(flow.async_step_user({"email": "a@b", "password": "x"}))
+
+    assert result["type"] == "form"
+    assert result["errors"]["base"] == "captcha_required"
+
+
+def test_user_step_maps_invalid_auth_error(monkeypatch: Any) -> None:
+    """Invalid credentials should map to invalid_auth."""
+
+    class FakeClient:
+        async def authenticate(self, _email: str, _password: str) -> dict[str, Any]:
+            raise config_flow.GloBirdAuthError()
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(config_flow, "GloBirdClient", lambda: FakeClient())
+
+    flow = config_flow.GloBirdConfigFlow()
+    result = asyncio.run(flow.async_step_user({"email": "a@b", "password": "x"}))
+
+    assert result["type"] == "form"
+    assert result["errors"]["base"] == "invalid_auth"
+
+
+def test_user_step_maps_unknown_error_to_cannot_connect(monkeypatch: Any) -> None:
+    """Unexpected failures should map to cannot_connect."""
+
+    class FakeClient:
+        async def authenticate(self, _email: str, _password: str) -> dict[str, Any]:
+            raise RuntimeError("boom")
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(config_flow, "GloBirdClient", lambda: FakeClient())
+
+    flow = config_flow.GloBirdConfigFlow()
+    result = asyncio.run(flow.async_step_user({"email": "a@b", "password": "x"}))
+
+    assert result["type"] == "form"
+    assert result["errors"]["base"] == "cannot_connect"

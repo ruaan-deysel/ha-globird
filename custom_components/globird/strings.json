@@ -2,7 +2,7 @@
   "config": {
     "step": {
       "user": {
-        "title": "GloBird HA",
+        "title": "GloBird",
         "description": "Enter your GloBird customer portal credentials.",
         "data": {
           "email": "Email",
@@ -23,7 +23,7 @@
   "options": {
     "step": {
       "init": {
-        "title": "GloBird HA options",
+        "title": "GloBird options",
         "description": "Set when automatic daily readiness polling resumes after the previous day is ready.",
         "data": {
           "daily_poll_start_time": "Daily polling start time"

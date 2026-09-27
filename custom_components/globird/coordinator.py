@@ -1,11 +1,13 @@
-"""Data update coordinator for GloBird HA."""
+"""Data update coordinator for GloBird"""
 
 from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, time as dt_time, timedelta
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from datetime import datetime, timedelta
+from datetime import time as dt_time
+from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -18,6 +20,7 @@ from .api import (
     all_services_ready_for_day,
     build_cost_summary,
     build_gas_reading_summary,
+    build_global_summary,
     build_latest_data_status,
     build_usage_summary,
     build_weather_summary,
@@ -31,8 +34,8 @@ from .const import (
     CONF_EMAIL,
     CONF_PASSWORD,
     DEFAULT_DAILY_POLL_START_TIME,
-    DEFAULT_USAGE_DAYS,
     DEFAULT_GAS_READING_DAYS,
+    DEFAULT_USAGE_DAYS,
     DOMAIN,
     STORAGE_VERSION,
 )
@@ -43,9 +46,7 @@ _LOGGER = logging.getLogger(__name__)
 def _is_expected_optional_fetch_failure(key: str, err: Exception) -> bool:
     """Return whether an optional endpoint failure is expected and non-critical."""
     message = str(err)
-    if key == "service_status" and "Unable to get AccountServiceStatus" in message:
-        return True
-    return False
+    return key == "service_status" and "Unable to get AccountServiceStatus" in message
 
 
 def _parse_daily_poll_start_time(value: Any) -> dt_time:
@@ -57,7 +58,7 @@ def _parse_daily_poll_start_time(value: Any) -> dt_time:
         minute = int(minute_raw)
         if 0 <= hour <= 23 and 0 <= minute <= 59:
             return dt_time(hour=hour, minute=minute)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         pass
     return dt_time(hour=0, minute=5)
 
@@ -125,9 +126,7 @@ class GloBirdCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             if isinstance(detail, dict)
             and "gas"
-            not in str(
-                (detail.get("service") or {}).get("serviceType") or ""
-            ).lower()
+            not in str((detail.get("service") or {}).get("serviceType") or "").lower()
         }
         ready_for_today = (
             all_services_ready_for_day(electricity_service_data, target_day)
@@ -182,7 +181,7 @@ class GloBirdCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Fetch optional data, falling back to cache on endpoint failure."""
         try:
             return await callback()
-        except Exception as err:  # noqa: BLE001 - optional portal endpoint.
+        except Exception as err:
             if _is_expected_optional_fetch_failure(key, err):
                 _LOGGER.debug(
                     "GloBird optional fetch unavailable for %s: %s",
@@ -298,6 +297,14 @@ class GloBirdCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
 
             data["service_data"] = service_data
+            data["global_summary"] = build_global_summary(
+                data.get("dashboard"),
+                data.get("balance"),
+                data.get("signup_info"),
+                last_update=data.get("last_update"),
+                refresh_error=None,
+                fetch_errors=fetch_errors,
+            )
             self._set_update_interval_for_data(data)
 
             self._cache = data
@@ -309,12 +316,21 @@ class GloBirdCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             return data
 
-        except Exception as err:  # noqa: BLE001 - coordinator should preserve cache.
+        except Exception as err:
             self.update_interval = ACCOUNT_UPDATE_INTERVAL
             if cache:
                 stale = dict(cache)
                 stale["refresh_error"] = str(err)
                 stale["last_failed_update"] = time.time()
+                stale["global_summary"] = build_global_summary(
+                    stale.get("dashboard"),
+                    stale.get("balance"),
+                    stale.get("signup_info"),
+                    last_update=stale.get("last_update"),
+                    last_failed_update=stale.get("last_failed_update"),
+                    refresh_error=stale.get("refresh_error"),
+                    fetch_errors=stale.get("_fetch_errors") or {},
+                )
                 return stale
             raise UpdateFailed(f"Unable to fetch GloBird data: {err}") from err
 
@@ -338,9 +354,7 @@ class GloBirdCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         account_service_id = service.get("accountServiceId")
         service_meters = await self._fetch_optional(
             "read_meters",
-            lambda: self.client.get_read_meters(
-                account_service_id=account_service_id
-            ),
+            lambda: self.client.get_read_meters(account_service_id=account_service_id),
             cache,
         )
         if not isinstance(service_meters, dict):

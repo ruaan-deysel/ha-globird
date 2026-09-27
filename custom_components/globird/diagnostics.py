@@ -1,4 +1,5 @@
-"""Diagnostics support for GloBird HA."""
+"""Diagnostics support for GloBird"""
+
 from __future__ import annotations
 
 from typing import Any

@@ -1,0 +1,15 @@
+{
+  "include": [
+    "custom_components/globird"
+  ],
+  "exclude": [
+    "tests",
+    "**/__pycache__",
+    ".venv",
+    ".local",
+    "build"
+  ],
+  "typeCheckingMode": "basic",
+  "reportMissingImports": false,
+  "reportCallIssue": false
+}

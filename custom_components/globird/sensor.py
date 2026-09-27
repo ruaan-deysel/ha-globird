@@ -1,4 +1,4 @@
-"""Sensor entities for GloBird HA."""
+"""Sensor entities for GloBird"""
 
 from __future__ import annotations
 
@@ -6,17 +6,17 @@ import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from datetime import time as dt_time
 from inspect import isawaitable
 from typing import Any
 
+from homeassistant.components.recorder.models import StatisticMeanType
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
     SensorStateClass,
 )
-from homeassistant.components.recorder.models import StatisticMeanType
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfEnergy, UnitOfTemperature, UnitOfVolume
 from homeassistant.core import HomeAssistant, callback
@@ -81,6 +81,9 @@ def _recent_transactions(data: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _balance_value(data: dict[str, Any]) -> Any:
+    summary = data.get("global_summary") or {}
+    if "balance" in summary:
+        return summary.get("balance")
     balance = _payload_data(data.get("balance")) or {}
     val = balance.get("balance")
     # GloBird returns positive for credit; negate so credit=negative, debt=positive
@@ -88,6 +91,12 @@ def _balance_value(data: dict[str, Any]) -> Any:
 
 
 def _balance_attrs(data: dict[str, Any]) -> dict[str, Any]:
+    summary = data.get("global_summary") or {}
+    if summary:
+        return {
+            "max_refundable_amount": summary.get("max_refundable_amount"),
+            "show_refundable_amount": summary.get("show_refundable_amount"),
+        }
     balance = _payload_data(data.get("balance")) or {}
     return {
         "max_refundable_amount": balance.get("maxRefundableAmount"),
@@ -96,12 +105,19 @@ def _balance_attrs(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def _dashboard_balance_value(data: dict[str, Any]) -> Any:
+    summary = data.get("global_summary") or {}
+    if "dashboard_balance" in summary:
+        return summary.get("dashboard_balance")
     dashboard = _payload_data(data.get("dashboard")) or {}
     val = dashboard.get("currentBalance")
     return -val if val is not None else None
 
 
 def _dashboard_attrs(data: dict[str, Any]) -> dict[str, Any]:
+    summary = data.get("global_summary") or {}
+    dashboard_summary = summary.get("dashboard") if isinstance(summary, dict) else None
+    if isinstance(dashboard_summary, dict):
+        return dict(dashboard_summary)
     dashboard = _payload_data(data.get("dashboard")) or {}
     return {
         "account_id": dashboard.get("accountId"),
@@ -113,20 +129,32 @@ def _dashboard_attrs(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def _latest_invoice_value(data: dict[str, Any]) -> Any:
+    summary = data.get("global_summary") or {}
+    if "latest_invoice_amount" in summary:
+        return summary.get("latest_invoice_amount")
     invoice = _latest_invoice(data)
     return invoice.get("amount") if invoice else None
 
 
 def _latest_invoice_attrs(data: dict[str, Any]) -> dict[str, Any]:
+    summary = data.get("global_summary") or {}
+    if isinstance(summary.get("latest_invoice"), dict):
+        return dict(summary.get("latest_invoice") or {})
     return dict(_latest_invoice(data) or {})
 
 
 def _signup_services_value(data: dict[str, Any]) -> int:
+    summary = data.get("global_summary") or {}
+    if isinstance(summary.get("signup_services"), int):
+        return summary.get("signup_services", 0)
     signup = _payload_data(data.get("signup_info"))
     return len(signup) if isinstance(signup, list) else 0
 
 
 def _signup_services_attrs(data: dict[str, Any]) -> dict[str, Any]:
+    summary = data.get("global_summary") or {}
+    if isinstance(summary.get("signup_info"), list):
+        return {"signup_info": summary.get("signup_info", [])}
     return {"signup_info": _payload_data(data.get("signup_info")) or []}
 
 
@@ -135,8 +163,8 @@ def _timestamp_value(value: Any) -> datetime | None:
     if value is None:
         return None
     try:
-        return datetime.fromtimestamp(float(value), timezone.utc)
-    except (TypeError, ValueError, OSError):
+        return datetime.fromtimestamp(float(value), UTC)
+    except TypeError, ValueError, OSError:
         return None
 
 
@@ -318,10 +346,23 @@ def _next_zerohero_status_boundary(now: datetime) -> datetime:
 
 
 def _refresh_status_value(data: dict[str, Any]) -> str:
+    summary = data.get("global_summary") or {}
+    if isinstance(summary.get("refresh_status"), str):
+        return summary.get("refresh_status", "ok")
     return "error" if data.get("refresh_error") else "ok"
 
 
 def _refresh_status_attrs(data: dict[str, Any]) -> dict[str, Any]:
+    summary = data.get("global_summary") or {}
+    if summary:
+        return {
+            "last_successful_refresh": _timestamp_attr(
+                summary.get("last_successful_refresh")
+            ),
+            "last_failed_refresh": _timestamp_attr(summary.get("last_failed_refresh")),
+            "refresh_error": summary.get("refresh_error"),
+            "fetch_errors": summary.get("fetch_errors") or {},
+        }
     return {
         "last_successful_refresh": _timestamp_attr(data.get("last_update")),
         "last_failed_refresh": _timestamp_attr(data.get("last_failed_update")),
@@ -774,7 +815,7 @@ class GloBirdLatestGasReadingSensor(GloBirdServiceBaseSensor):
             StatisticData(**row)
             for row in _build_gas_statistics(
                 history_rows,
-                tzinfo=dt_util.now().tzinfo or timezone.utc,
+                tzinfo=dt_util.now().tzinfo or UTC,
             )
         ]
 
@@ -813,7 +854,7 @@ class GloBirdLatestGasReadingSensor(GloBirdServiceBaseSensor):
             add_result = async_add_external_statistics(self.hass, metadata, statistics)
             if isawaitable(add_result):
                 await add_result
-        except Exception as err:  # noqa: BLE001 - statistics import is best-effort.
+        except Exception as err:
             _LOGGER.warning(
                 "GloBird gas statistics import skipped for %s (%s): %s",
                 self._service_id,
@@ -1053,7 +1094,7 @@ class GloBirdZeroHeroStatusSensor(GloBirdServiceBaseSensor):
     sensor_name = "ZeroHero Status"
     icon = "mdi:check-decagram"
     device_class = SensorDeviceClass.ENUM
-    _attr_options = list(ZEROHERO_STATUS_OPTIONS)
+    _attr_options = ZEROHERO_STATUS_OPTIONS
 
     def __init__(
         self,

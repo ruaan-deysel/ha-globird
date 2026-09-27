@@ -1,13 +1,13 @@
-"""Constants for the GloBird HA integration."""
+"""Constants for the GloBird integration."""
 
 from __future__ import annotations
 
 from datetime import timedelta
 
-DOMAIN = "globird_ha"
+DOMAIN = "globird"
 
 CONF_EMAIL = "email"
-CONF_PASSWORD = "password"
+CONF_PASSWORD = "password"  # nosec B105 - configuration key name, not a secret
 CONF_DAILY_POLL_START_TIME = "daily_poll_start_time"
 DEFAULT_DAILY_POLL_START_TIME = "00:05"
 

@@ -1,4 +1,5 @@
-"""GloBird HA integration."""
+"""GloBird integration."""
+
 from __future__ import annotations
 
 import logging
@@ -16,7 +17,7 @@ PLATFORMS = [Platform.SENSOR]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up GloBird HA from a config entry."""
+    """Set up GloBird from a config entry."""
     hass.data.setdefault(DOMAIN, {})
 
     coordinator = GloBirdCoordinator(hass, entry)
@@ -41,4 +42,3 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         coordinator: GloBirdCoordinator = hass.data[DOMAIN].pop(entry.entry_id)
         await coordinator.async_shutdown()
     return unload_ok
-

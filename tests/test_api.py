@@ -16,16 +16,17 @@ from typing import Any
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "globird_responses.json"
 GAS_FIXTURE_PATH = Path(__file__).parent / "fixtures" / "globird_gas_responses.json"
 COMPONENT_PATH = Path(__file__).parents[1] / "custom_components"
-INTEGRATION_PATH = COMPONENT_PATH / "globird_ha"
+INTEGRATION_PATH = COMPONENT_PATH / "globird"
 
 custom_components = types.ModuleType("custom_components")
 custom_components.__path__ = [str(COMPONENT_PATH)]  # type: ignore[attr-defined]
-globird_package = types.ModuleType("custom_components.globird_ha")
+globird_package = types.ModuleType("custom_components.globird")
 globird_package.__path__ = [str(INTEGRATION_PATH)]  # type: ignore[attr-defined]
 sys.modules.setdefault("custom_components", custom_components)
-sys.modules.setdefault("custom_components.globird_ha", globird_package)
+sys.modules.setdefault("custom_components.globird", globird_package)
 
-api = importlib.import_module("custom_components.globird_ha.api")
+api = importlib.import_module("custom_components.globird.api")
+api_impl = importlib.import_module("custom_components.globird.api.api")
 
 GloBirdCaptchaRequired = api.GloBirdCaptchaRequired
 GloBirdAuthError = api.GloBirdAuthError
@@ -61,7 +62,7 @@ class FakeResponse:
         self.status = status
         self._payload = payload
 
-    async def __aenter__(self) -> "FakeResponse":
+    async def __aenter__(self) -> FakeResponse:
         return self
 
     async def __aexit__(self, *_exc: object) -> None:
@@ -236,7 +237,7 @@ def test_extract_accounts_services_and_summaries() -> None:
     assert usage["total_usage"] == 3.5
     assert usage["latest_day"] == "2026-04-02"
     assert usage["latest_intervals"] == [0.4, 0.5, 0.6]
-    # Fixture: 2 days × (SOLAR + USAGE + SUPPLY). Net = (1.48) + (-0.43) = 1.05
+    # Fixture: 2 days x (SOLAR + USAGE + SUPPLY). Net = (1.48) + (-0.43) = 1.05
     assert cost["total_amount"] == 1.05
     assert cost["total_quantity"] == 21.5
     # latest_day_amount is the net sum for 2026/04/02: -2.36 + 0.60 + 1.33 = -0.43
@@ -848,6 +849,334 @@ def test_redact_sensitive_diagnostics() -> None:
     assert redacted["password"] == "**REDACTED**"
     assert redacted["nested"]["accountNumber"] == "**REDACTED**"
     assert redacted["nested"]["safe"] == "kept"
+
+
+def test_restore_session_success_and_failure() -> None:
+    """restore_session should toggle authentication based on currentuser response."""
+    success_session = FakeSession(
+        [(200, {"data": {"emailAddress": "u"}, "success": True})]
+    )
+    success_client = GloBirdClient(
+        session=success_session, base_url="https://example.test"
+    )
+
+    restored = asyncio.run(
+        success_client.restore_session("user@example.test", "secret")
+    )
+    assert restored is not None
+    assert success_client.is_authenticated is True
+
+    failed_session = FakeSession([(500, {"success": False})])
+    failed_client = GloBirdClient(
+        session=failed_session, base_url="https://example.test"
+    )
+    restored_none = asyncio.run(
+        failed_client.restore_session("user@example.test", "secret")
+    )
+    assert restored_none is None
+    assert failed_client.is_authenticated is False
+
+
+def test_service_endpoints_build_expected_paths() -> None:
+    """Endpoint helpers should include optional query parameters."""
+    session = FakeSession(
+        [
+            (200, {"success": True, "data": {}}),
+            (200, {"success": True, "data": {}}),
+            (200, {"success": True, "data": []}),
+            (200, {"success": True, "data": {}}),
+            (200, {"success": True, "data": {}}),
+        ]
+    )
+    client = GloBirdClient(session=session, base_url="https://example.test")
+
+    async def scenario() -> None:
+        await client.get_dashboard(account_id=1)
+        await client.get_balance(account_id=1)
+        await client.get_signup_info(account_id=1)
+        await client.get_power_meter_types(nmi="NMI-1")
+        await client.get_read_meters(account_service_id=10)
+
+    asyncio.run(scenario())
+
+    assert session.requests[0][1].endswith("/api/account/dashboard?accountId=1")
+    assert session.requests[1][1].endswith("/api/transaction/balance?accountId=1")
+    assert session.requests[2][1].endswith("/api/account/getSignupInfo?accountId=1")
+    assert session.requests[3][1].endswith("/api/site/GetPowerMeterTypes?nmi=NMI-1")
+    assert session.requests[4][1].endswith("/api/site/readmeters?accountServiceId=10")
+
+
+def test_cost_and_weather_requests_include_expected_payload_keys() -> None:
+    """POST payloads should contain the required API fields."""
+    session = FakeSession(
+        [
+            (200, {"success": True, "data": []}),
+            (200, {"success": True, "data": []}),
+        ]
+    )
+    client = GloBirdClient(session=session, base_url="https://example.test")
+
+    async def scenario() -> None:
+        await client.get_cost_detail(
+            account_service_id=10,
+            identifier="NMI-1",
+            is_smart=True,
+            days=3,
+        )
+        await client.get_weather_data(account_service_id=10, post_code="3000", days=3)
+
+    asyncio.run(scenario())
+
+    cost_payload = session.requests[0][2]["json"]
+    weather_payload = session.requests[1][2]["json"]
+    assert "from" in cost_payload and "to" in cost_payload
+    assert cost_payload["accountServiceId"] == 10
+    assert "dateFrom" in weather_payload and "dateTo" in weather_payload
+    assert weather_payload["postCode"] == "3000"
+
+
+def test_cookie_export_import_and_html_decode_roundtrip() -> None:
+    """Cookie helpers should export/import values and HTML-decoded JSON."""
+
+    class FakeCookie:
+        def __init__(self, name: str, value: str) -> None:
+            self.key = name
+            self.value = value
+            self._meta = {
+                "domain": "example.test",
+                "path": "/",
+                "secure": True,
+                "httponly": True,
+            }
+
+        def __getitem__(self, key: str) -> Any:
+            return self._meta[key]
+
+    class FakeCookieJar:
+        def __init__(self) -> None:
+            self._cookies = [FakeCookie("ARRAffinity", "abc")]
+
+        def __iter__(self) -> Any:
+            return iter(self._cookies)
+
+        def update_cookies(self, _cookies: Any, _url: Any) -> None:
+            return None
+
+    session = FakeSession([])
+    session.cookie_jar = FakeCookieJar()
+    client = GloBirdClient(session=session, base_url="https://example.test")
+
+    client.import_session_cookies(
+        [
+            {
+                "name": "ARRAffinity",
+                "value": "abc",
+                "domain": "example.test",
+                "path": "/",
+                "secure": "True",
+                "httponly": "True",
+            }
+        ]
+    )
+    exported = client.export_session_cookies()
+    assert any(cookie["name"] == "ARRAffinity" for cookie in exported)
+
+    decoded = GloBirdClient.decode_html_json("{&quot;a&quot;: 1}")
+    assert decoded == {"a": 1}
+
+
+def test_small_helper_edge_cases() -> None:
+    """Exercise helper fallback branches for parser and summary helpers."""
+    assert api_impl._as_float(None) is None
+    assert api_impl._as_float("x") is None
+    assert api_impl._round(None) is None
+    assert api_impl._payload_data(None) is None
+    assert api_impl._date_key({"a": None}, "a", "b") == ""
+    assert api_impl._parse_date("not-a-date") is None
+    assert api_impl._recent_rows("bad") == []
+    assert (
+        api_impl._usage_latest_day({"latest_day": "2026-01-01"}, ["bad"])
+        == "2026-01-01"
+    )
+    assert api_impl._meter_status_rank({}) == 2
+    assert api_impl._meter_status_rank({"serialStatus": "mystery"}) == 1
+    assert api_impl._meter_type_rank({}) == 0
+
+
+def test_select_meter_supports_nested_wrapped_lists() -> None:
+    """Meter payload wrapper keys should be handled consistently."""
+    selected = select_meter_for_service(
+        {"siteIdentifier": "NMI-X"},
+        {"data": {"readMeters": [{"siteIdentifier": "NMI-X", "serialNumber": "m1"}]}},
+    )
+    assert selected is not None
+    assert selected["serialNumber"] == "m1"
+
+
+def test_global_summary_defaults_without_payloads() -> None:
+    """Global summary should return stable defaults for missing payloads."""
+    summary = api.build_global_summary(
+        None,
+        None,
+        None,
+        last_update=None,
+        last_failed_update=None,
+        refresh_error="err",
+        fetch_errors=None,
+    )
+    assert summary["refresh_status"] == "error"
+    assert summary["signup_services"] == 0
+    assert summary["signup_info"] == []
+
+
+def test_raw_request_json_error_modes() -> None:
+    """HTTP/auth/json/payload failure branches should raise API errors."""
+    client = GloBirdClient(
+        session=FakeSession([(403, {"success": False})]),
+        base_url="https://example.test",
+    )
+    try:
+        asyncio.run(client._raw_request_json("GET", "/x"))
+    except api.GloBirdSessionExpired:
+        pass
+    else:
+        raise AssertionError("Expected session-expired error")
+
+    client = GloBirdClient(
+        session=FakeSession([(500, {"success": False})]),
+        base_url="https://example.test",
+    )
+    try:
+        asyncio.run(client._raw_request_json("GET", "/x"))
+    except api.GloBirdApiError:
+        pass
+    else:
+        raise AssertionError("Expected HTTP API error")
+
+    class InvalidJsonResponse(FakeResponse):
+        async def text(self) -> str:
+            return "{oops"
+
+    class InvalidJsonSession(FakeSession):
+        def request(self, method: str, url: str, **kwargs: Any) -> FakeResponse:
+            self.requests.append((method, url, kwargs))
+            return InvalidJsonResponse(200, {})
+
+    client = GloBirdClient(
+        session=InvalidJsonSession([]), base_url="https://example.test"
+    )
+    try:
+        asyncio.run(client._raw_request_json("GET", "/x"))
+    except api.GloBirdApiError:
+        pass
+    else:
+        raise AssertionError("Expected invalid JSON API error")
+
+    client = GloBirdClient(
+        session=FakeSession([(200, {"success": False, "message": "nope"})]),
+        base_url="https://example.test",
+    )
+    try:
+        asyncio.run(client._raw_request_json("GET", "/x"))
+    except api.GloBirdApiError:
+        pass
+    else:
+        raise AssertionError("Expected payload failure API error")
+
+    client = GloBirdClient(
+        session=FakeSession([(200, {"success": False, "message": "ok to pass"})]),
+        base_url="https://example.test",
+    )
+    payload = asyncio.run(client._raw_request_json("GET", "/x", allow_api_failure=True))
+    assert payload["success"] is False
+
+
+def test_request_json_no_retry_when_auth_not_possible() -> None:
+    """Request wrapper should re-raise expiry when retry preconditions fail."""
+    client = GloBirdClient(session=FakeSession([]), base_url="https://example.test")
+
+    async def raise_expired(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise api.GloBirdSessionExpired("expired")
+
+    client._raw_request_json = raise_expired  # type: ignore[method-assign]
+    try:
+        asyncio.run(client._request_json("GET", "/x", retry_auth=False))
+    except api.GloBirdSessionExpired:
+        pass
+    else:
+        raise AssertionError("Expected session-expired re-raise")
+
+
+def test_establish_session_handles_sticky_and_exceptions() -> None:
+    """Session establishment should copy sticky cookies and swallow failures."""
+
+    class Cookie:
+        def __init__(self, key: str, value: str) -> None:
+            self.key = key
+            self.value = value
+
+    class CookieJar:
+        def __init__(self) -> None:
+            self.updated = None
+
+        def __iter__(self) -> Any:
+            return iter([Cookie("ARRAffinity", "abc")])
+
+        def update_cookies(self, cookies: Any, primary: Any) -> None:
+            self.updated = (cookies, primary)
+
+    class Resp(FakeResponse):
+        async def read(self) -> bytes:
+            return b"ok"
+
+    class GoodSession(FakeSession):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.cookie_jar = CookieJar()
+
+        def request(self, method: str, url: str, **kwargs: Any) -> FakeResponse:
+            self.requests.append((method, url, kwargs))
+            return Resp(200, {})
+
+    good = GoodSession()
+    client = GloBirdClient(session=good, base_url="https://example.test")
+    asyncio.run(client._establish_session())
+    assert good.cookie_jar.updated is not None
+
+    class BadSession(GoodSession):
+        def request(self, method: str, url: str, **kwargs: Any) -> FakeResponse:
+            raise RuntimeError("network")
+
+    bad = BadSession()
+    client = GloBirdClient(session=bad, base_url="https://example.test")
+    asyncio.run(client._establish_session())
+
+
+def test_authenticate_login_failure_with_message() -> None:
+    """Failed login should include portal message and keep auth false."""
+    session = FakeSession(
+        [
+            (
+                200,
+                {
+                    "success": False,
+                    "message": "bad creds",
+                    "data": {"isLoginSucceeded": False},
+                },
+            ),
+        ]
+    )
+    client = GloBirdClient(session=session, base_url="https://example.test")
+    stub_password_encryption(client)
+    try:
+        asyncio.run(
+            client.authenticate("user@example.test", "wrong", fresh_session=False)
+        )
+    except api.GloBirdAuthError as err:
+        assert "bad creds" in str(err)
+    else:
+        raise AssertionError("Expected auth error")
+    assert client.is_authenticated is False
 
 
 def load_tests(

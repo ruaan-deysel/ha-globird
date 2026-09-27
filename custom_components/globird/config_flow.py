@@ -1,4 +1,5 @@
-"""Config flow for GloBird HA."""
+"""Config flow for GloBird"""
+
 from __future__ import annotations
 
 import logging
@@ -21,8 +22,11 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 
-class GloBirdConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
-    """Handle a config flow for GloBird HA."""
+class GloBirdConfigFlow(  # pyright: ignore[reportGeneralTypeIssues, reportCallIssue]
+    config_entries.ConfigFlow,
+    domain=DOMAIN,
+):
+    """Handle a config flow for GloBird"""
 
     VERSION = 1
 
@@ -53,8 +57,8 @@ class GloBirdConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 errors["base"] = "captcha_required"
             except GloBirdAuthError:
                 errors["base"] = "invalid_auth"
-            except Exception as err:  # noqa: BLE001 - HA config flow maps this.
-                _LOGGER.exception("Unexpected GloBird setup failure: %s", err)
+            except Exception:
+                _LOGGER.exception("Unexpected GloBird setup failure")
                 errors["base"] = "cannot_connect"
             else:
                 return self.async_create_entry(
@@ -84,7 +88,7 @@ class GloBirdConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class GloBirdOptionsFlow(config_entries.OptionsFlow):
-    """Handle GloBird HA options."""
+    """Handle GloBird options."""
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None

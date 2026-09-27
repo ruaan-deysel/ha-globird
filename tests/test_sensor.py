@@ -2,24 +2,25 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
 import sys
 import types
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 COMPONENT_PATH = Path(__file__).parents[1] / "custom_components"
-INTEGRATION_PATH = COMPONENT_PATH / "globird_ha"
+INTEGRATION_PATH = COMPONENT_PATH / "globird"
 GAS_FIXTURE_PATH = Path(__file__).parent / "fixtures" / "globird_gas_responses.json"
 
 custom_components = types.ModuleType("custom_components")
 custom_components.__path__ = [str(COMPONENT_PATH)]  # type: ignore[attr-defined]
-globird_package = types.ModuleType("custom_components.globird_ha")
+globird_package = types.ModuleType("custom_components.globird")
 globird_package.__path__ = [str(INTEGRATION_PATH)]  # type: ignore[attr-defined]
 sys.modules["custom_components"] = custom_components
-sys.modules["custom_components.globird_ha"] = globird_package
+sys.modules["custom_components.globird"] = globird_package
 
 homeassistant = types.ModuleType("homeassistant")
 components = types.ModuleType("homeassistant.components")
@@ -36,6 +37,7 @@ storage = types.ModuleType("homeassistant.helpers.storage")
 update_coordinator = types.ModuleType("homeassistant.helpers.update_coordinator")
 util = types.ModuleType("homeassistant.util")
 dt = types.ModuleType("homeassistant.util.dt")
+util_logging = types.ModuleType("homeassistant.util.logging")
 unit_conversion = types.ModuleType("homeassistant.util.unit_conversion")
 
 
@@ -65,7 +67,7 @@ class SensorStateClass:
 class CoordinatorEntity:
     """Minimal stand-in for Home Assistant's CoordinatorEntity."""
 
-    def __class_getitem__(cls, _item: Any) -> type["CoordinatorEntity"]:
+    def __class_getitem__(cls, _item: Any) -> type[CoordinatorEntity]:
         return cls
 
     def __init__(self, coordinator: Any) -> None:
@@ -90,7 +92,7 @@ class CoordinatorEntity:
 class DataUpdateCoordinator:
     """Minimal stand-in for Home Assistant's DataUpdateCoordinator."""
 
-    def __class_getitem__(cls, _item: Any) -> type["DataUpdateCoordinator"]:
+    def __class_getitem__(cls, _item: Any) -> type[DataUpdateCoordinator]:
         return cls
 
     def __init__(
@@ -141,8 +143,10 @@ update_coordinator.DataUpdateCoordinator = DataUpdateCoordinator
 update_coordinator.UpdateFailed = UpdateFailed
 recorder_models.StatisticMeanType = StatisticMeanType
 unit_conversion.VolumeConverter = types.SimpleNamespace(UNIT_CLASS="volume")
-dt.now = lambda: datetime.now(timezone.utc)
+dt.now = lambda: datetime.now(UTC)
 util.dt = dt
+util_logging.log_exception = lambda *_args, **_kwargs: None
+util.logging = util_logging
 util.unit_conversion = unit_conversion
 
 components.sensor = sensor_component
@@ -173,9 +177,10 @@ sys.modules["homeassistant.helpers.storage"] = storage
 sys.modules["homeassistant.helpers.update_coordinator"] = update_coordinator
 sys.modules["homeassistant.util"] = util
 sys.modules["homeassistant.util.dt"] = dt
+sys.modules["homeassistant.util.logging"] = util_logging
 sys.modules["homeassistant.util.unit_conversion"] = unit_conversion
 
-sensor = importlib.import_module("custom_components.globird_ha.sensor")
+sensor = importlib.import_module("custom_components.globird.sensor")
 
 
 def load_gas_fixtures() -> dict[str, Any]:
@@ -422,7 +427,7 @@ def test_gas_statistics_ignore_downward_correction_without_double_counting() -> 
             {"date": "2026-02-01", "read_index": 95.0, "serial": "meter"},
             {"date": "2026-03-01", "read_index": 102.0, "serial": "meter"},
         ],
-        tzinfo=timezone.utc,
+        tzinfo=UTC,
     )
 
     assert [row["sum"] for row in statistics] == [100.0, 100.0, 102.0]
@@ -448,3 +453,399 @@ def test_latest_gas_reading_sensor_exposes_reading_summary() -> None:
     assert sensor_entity.native_value == 3050.0
     assert sensor_entity.extra_state_attributes["latest_reading_date"] == "2026-07-12"
     assert sensor_entity.extra_state_attributes["history_count"] == 1
+
+
+def test_global_sensors_return_values_and_attributes() -> None:
+    """Global sensor descriptors should map coordinator data into state values."""
+
+    class FakeCoordinator:
+        data = {
+            "dashboard": {
+                "data": {
+                    "currentBalance": 42.2,
+                    "accountId": 1,
+                    "accountNumber": "A1",
+                    "lastestCorrespondence": {"id": 1},
+                    "lastestInvoice": {"amount": 12.34},
+                    "recentAccountTransactions": [{"id": "t1"}],
+                }
+            },
+            "balance": {
+                "data": {
+                    "balance": 55.0,
+                    "maxRefundableAmount": 10.0,
+                    "showRefundableAmount": True,
+                }
+            },
+            "signup_info": {"data": [1, 2, 3]},
+            "last_update": 1700000000,
+            "_fetch_errors": {},
+        }
+
+    entities = [
+        sensor.GloBirdGlobalSensor(
+            FakeCoordinator(),
+            types.SimpleNamespace(entry_id="entry-1"),
+            description,
+        )
+        for description in sensor.GLOBAL_SENSORS
+    ]
+
+    assert len(entities) == len(sensor.GLOBAL_SENSORS)
+    values = {entity._description.key: entity.native_value for entity in entities}
+    assert values["balance"] == -55.0
+    assert values["dashboard_balance"] == -42.2
+    assert values["latest_invoice"] == 12.34
+    assert values["signup_services"] == 3
+    assert values["refresh_status"] == "ok"
+
+    attrs = {
+        entity._description.key: entity.extra_state_attributes for entity in entities
+    }
+    assert attrs["balance"]["max_refundable_amount"] == 10.0
+    assert attrs["dashboard_balance"]["account_number"] == "A1"
+
+
+def test_service_sensors_return_expected_values() -> None:
+    """Service-level sensors should read from service_data generated by API summaries."""
+
+    service = {
+        "accountServiceId": 810965,
+        "siteIdentifier": "NMI-1",
+        "siteAddress": "Street",
+        "postCode": "3000",
+        "serviceType": "Power",
+        "accountId": 1,
+        "accountNumber": "A1",
+    }
+    detail = {
+        "service": service,
+        "status": {"status": "Switched"},
+        "meter": {"meterReadType": "SMART", "serialStatus": "Active"},
+        "usage_summary": {
+            "total_usage": 10.5,
+            "latest_day_usage": 1.2,
+            "total_export": 3.4,
+            "latest_day_export": 0.3,
+            "daily": [{"readDate": "2026-07-01", "usage": 1.2}],
+            "export_daily": [{"readDate": "2026-07-01", "usage": 0.3}],
+            "latest_intervals": [0.4, 0.8],
+            "registers": [],
+        },
+        "cost_summary": {
+            "total_amount": 12.5,
+            "latest_day_amount": 1.1,
+            "latest_day": "2026/07/01",
+            "latest_available_day": "2026/07/01",
+            "latest_available_day_complete": True,
+            "latest_day_zerohero_credit": -0.2,
+            "latest_day_zerohero_achieved": True,
+            "daily": [],
+            "daily_totals": [{"date": "2026/07/01", "amount": 1.1}],
+            "available_daily": [],
+            "categories": [],
+        },
+        "latest_data_status": {
+            "status": "ready",
+            "latest_ready_day": "2026/07/01",
+            "latest_usage_day": "2026/07/01",
+            "latest_cost_day": "2026/07/01",
+            "latest_available_cost_day": "2026/07/01",
+            "latest_available_cost_day_complete": True,
+            "incomplete_cost_days": [],
+        },
+        "weather_summary": {
+            "days": 1,
+            "latest_date": "2026-07-01",
+            "latest_min_temp": 12,
+            "latest_max_temp": 27,
+            "daily": [{"dateAsDate": "2026-07-01", "obMinTemp": 12, "obMaxTemp": 27}],
+        },
+    }
+
+    class FakeCoordinator:
+        data = {
+            "service_data": {"810965": detail},
+            "dashboard": {
+                "data": {"lastestInvoice": {"issuedDate": "2026-07-01T00:00:00"}}
+            },
+            "last_update": 1700000000,
+        }
+
+    entry = types.SimpleNamespace(entry_id="entry-1")
+    created = [
+        sensor.GloBirdServiceStatusSensor(FakeCoordinator(), entry, service),
+        sensor.GloBirdMeterInfoSensor(FakeCoordinator(), entry, service),
+        sensor.GloBirdLatestDataDateSensor(FakeCoordinator(), entry, service),
+        sensor.GloBirdLatestDataStatusSensor(FakeCoordinator(), entry, service),
+        sensor.GloBirdUsageTotalSensor(FakeCoordinator(), entry, service),
+        sensor.GloBirdLatestDayUsageSensor(FakeCoordinator(), entry, service),
+        sensor.GloBirdSolarExportTotalSensor(FakeCoordinator(), entry, service),
+        sensor.GloBirdLatestDaySolarExportSensor(FakeCoordinator(), entry, service),
+        sensor.GloBirdCostTotalSensor(FakeCoordinator(), entry, service),
+        sensor.GloBirdLatestDayCostSensor(FakeCoordinator(), entry, service),
+        sensor.GloBirdZeroHeroStatusSensor(FakeCoordinator(), entry, service),
+        sensor.GloBirdExpectedMonthlyCostSensor(FakeCoordinator(), entry, service),
+        sensor.GloBirdBillingPeriodDaysSensor(FakeCoordinator(), entry, service),
+        sensor.GloBirdBillingPeriodCostSensor(FakeCoordinator(), entry, service),
+        sensor.GloBirdWeatherSummarySensor(FakeCoordinator(), entry, service),
+    ]
+
+    values = [entity.native_value for entity in created]
+    assert "Switched" in values
+    assert "SMART" in values
+    assert "2026/07/01" in values
+    assert "ready" in values
+    assert 10.5 in values
+    assert 1.2 in values
+    assert 3.4 in values
+    assert 0.3 in values
+    assert 12.5 in values
+    assert 1.1 in values
+    assert "achieved" in values
+    assert 27 in values
+
+    # Touch attributes for branch coverage across sensor classes.
+    for entity in created:
+        attrs = entity.extra_state_attributes
+        assert "service_type" in attrs
+
+
+def test_async_setup_entry_adds_global_account_and_service_entities() -> None:
+    """Setup should create entity instances for global, account, and service sensors."""
+
+    class FakeCoordinator:
+        data = {
+            "accounts": [
+                {
+                    "accountId": 1,
+                    "accountNumber": "A1",
+                    "service_count": 1,
+                }
+            ],
+            "services": [
+                {
+                    "accountServiceId": 810965,
+                    "serviceType": "Power",
+                    "siteIdentifier": "NMI-1",
+                }
+            ],
+            "service_data": {
+                "810965": {
+                    "service": {
+                        "accountServiceId": 810965,
+                        "serviceType": "Power",
+                        "siteIdentifier": "NMI-1",
+                    },
+                    "usage_summary": {},
+                    "cost_summary": {},
+                    "latest_data_status": {},
+                    "weather_summary": {},
+                }
+            },
+        }
+
+    hass = {
+        sensor.DOMAIN: {
+            "entry-1": FakeCoordinator(),
+        }
+    }
+
+    captured: list[Any] = []
+
+    def add_entities(entities: list[Any]) -> None:
+        captured.extend(entities)
+
+    asyncio.run(
+        sensor.async_setup_entry(
+            types.SimpleNamespace(data=hass),
+            types.SimpleNamespace(entry_id="entry-1"),
+            add_entities,
+        )
+    )
+
+    assert captured
+    assert any(isinstance(entity, sensor.GloBirdGlobalSensor) for entity in captured)
+    assert any(
+        isinstance(entity, sensor.GloBirdAccountSummarySensor) for entity in captured
+    )
+
+
+def test_global_helper_fallback_branches_without_global_summary() -> None:
+    """Helper fallbacks should work when API global summary is unavailable."""
+    data = {
+        "dashboard": {
+            "data": {
+                "currentBalance": 2.5,
+                "accountId": 1,
+                "accountNumber": "A1",
+                "lastestCorrespondence": {"id": 1},
+                "lastestInvoice": {"amount": 5.5},
+                "recentAccountTransactions": [{"id": "t1"}],
+            }
+        },
+        "balance": {
+            "data": {
+                "balance": 3.1,
+                "maxRefundableAmount": 1,
+                "showRefundableAmount": True,
+            }
+        },
+        "signup_info": {"data": [1]},
+        "last_update": 1700000000,
+    }
+
+    assert sensor._balance_value(data) == -3.1
+    assert sensor._dashboard_balance_value(data) == -2.5
+    assert sensor._latest_invoice_value(data) == 5.5
+    assert sensor._signup_services_value(data) == 1
+    assert sensor._refresh_status_value(data) == "ok"
+    assert sensor._dashboard_attrs(data)["account_number"] == "A1"
+    assert sensor._latest_invoice_attrs(data)["amount"] == 5.5
+
+
+def test_account_summary_returns_empty_when_account_missing() -> None:
+    """Account summary entity should gracefully handle missing account rows."""
+
+    class FakeCoordinator:
+        data = {"accounts": []}
+
+    entity = sensor.GloBirdAccountSummarySensor(
+        FakeCoordinator(),
+        types.SimpleNamespace(entry_id="entry-1"),
+        {"accountId": 123, "accountNumber": "A123"},
+    )
+    assert entity.native_value is None
+    assert entity.extra_state_attributes == {}
+
+
+def test_zerohero_boundary_scheduling_and_callbacks(monkeypatch: Any) -> None:
+    """ZeroHero sensor should schedule and cancel boundary callbacks."""
+
+    scheduled = {}
+
+    def fake_track(_hass: Any, callback: Any, when: Any) -> Any:
+        scheduled["callback"] = callback
+        scheduled["when"] = when
+
+        def unsub() -> None:
+            scheduled["unsub_called"] = True
+
+        return unsub
+
+    monkeypatch.setattr(sensor, "async_track_point_in_time", fake_track)
+
+    class FakeCoordinator:
+        data = {
+            "service_data": {
+                "1": {"service": {"accountServiceId": 1}, "cost_summary": {}}
+            }
+        }
+
+    entity = sensor.GloBirdZeroHeroStatusSensor(
+        FakeCoordinator(),
+        types.SimpleNamespace(entry_id="entry-1"),
+        {"accountServiceId": 1, "serviceType": "Power"},
+    )
+    entity.hass = types.SimpleNamespace()
+
+    asyncio.run(entity.async_added_to_hass())
+    assert "when" in scheduled
+
+    entity._handle_zerohero_boundary_update(datetime.now(UTC))
+    entity._cancel_zerohero_boundary_update()
+    assert scheduled.get("unsub_called") is True
+
+
+def test_gas_statistics_import_paths(monkeypatch: Any) -> None:
+    """Gas statistics uploader should handle success and add failures safely."""
+
+    class FakeCoordinator:
+        data = {
+            "service_data": {
+                "123": {
+                    "service": {"accountServiceId": 123, "serviceType": "Gas"},
+                    "gas_reading_summary": {
+                        "history": [
+                            {"date": "2026-01-01", "read_index": 100.0, "serial": "x"},
+                            {"date": "2026-01-02", "read_index": 101.0, "serial": "x"},
+                        ],
+                        "latest_reading": 101.0,
+                    },
+                }
+            }
+        }
+
+    entity = sensor.GloBirdLatestGasReadingSensor(
+        FakeCoordinator(),
+        types.SimpleNamespace(entry_id="entry-1"),
+        {"accountServiceId": 123, "serviceType": "Gas"},
+    )
+    entity.hass = types.SimpleNamespace(async_create_task=lambda _coro: None)
+
+    recorder_statistics = types.ModuleType(
+        "homeassistant.components.recorder.statistics"
+    )
+
+    class StatisticData(dict):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+
+    class StatisticMetaData(dict):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+
+    async def add_ok(_hass: Any, _meta: Any, _stats: Any) -> None:
+        return None
+
+    recorder_statistics.StatisticData = StatisticData
+    recorder_statistics.StatisticMetaData = StatisticMetaData
+    recorder_statistics.async_add_external_statistics = add_ok
+    sys.modules["homeassistant.components.recorder.statistics"] = recorder_statistics
+
+    asyncio.run(entity._async_upload_historical_statistics())
+
+    async def add_fail(_hass: Any, _meta: Any, _stats: Any) -> None:
+        raise RuntimeError("fail")
+
+    recorder_statistics.async_add_external_statistics = add_fail
+    asyncio.run(entity._async_upload_historical_statistics())
+
+
+def test_latest_data_status_fallback_and_billing_start_invalid() -> None:
+    """Fallback status and invalid billing date should be handled gracefully."""
+    status = sensor._latest_data_status({"usage_summary": {}, "cost_summary": {}})
+    assert status["status"] == "no_data"
+    assert (
+        sensor._billing_period_start(
+            {"dashboard": {"data": {"lastestInvoice": {"issuedDate": "bad"}}}}
+        )
+        is None
+    )
+
+
+def test_billing_period_cost_sensor_fallbacks() -> None:
+    """Billing period cost sensor should return fallback totals when no start date."""
+
+    service = {"accountServiceId": 1, "serviceType": "Power", "siteIdentifier": "NMI"}
+
+    class FakeCoordinator:
+        data = {
+            "dashboard": {"data": {"lastestInvoice": {}}},
+            "service_data": {
+                "1": {
+                    "service": service,
+                    "cost_summary": {
+                        "total_amount": 4.2,
+                        "daily_totals": [{"date": "2026/01/01", "amount": 4.2}],
+                    },
+                }
+            },
+        }
+
+    entity = sensor.GloBirdBillingPeriodCostSensor(
+        FakeCoordinator(),
+        types.SimpleNamespace(entry_id="entry-1"),
+        service,
+    )
+    assert entity.native_value == 4.2

@@ -7,7 +7,7 @@ import calendar
 import html
 import json
 import logging
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import UTC, date, datetime, time, timedelta
 from http.cookies import SimpleCookie
 from typing import Any
 
@@ -17,7 +17,14 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicNumbers
 from yarl import URL
 
-from .const import BASE_URL, DEFAULT_USAGE_DAYS, SENSITIVE_KEYS
+from ..const import BASE_URL, DEFAULT_USAGE_DAYS, SENSITIVE_KEYS
+from .models import (
+    CostSummary,
+    GasReadingSummary,
+    LatestDataStatus,
+    UsageSummary,
+    WeatherSummary,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -46,7 +53,7 @@ def _as_float(value: Any) -> float | None:
         return None
     try:
         return float(value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 
@@ -77,13 +84,11 @@ def _parse_date(value: Any) -> date | None:
     """Parse a portal date value."""
     if not value:
         return None
-    raw = str(value).split("T")[0]
-    for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
-        try:
-            return datetime.strptime(raw, fmt).date()
-        except ValueError:
-            continue
-    return None
+    raw = str(value).split("T")[0].replace("/", "-")
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        return None
 
 
 def _cost_category(row: dict[str, Any]) -> str:
@@ -197,6 +202,61 @@ def cost_attributes(summary: dict[str, Any]) -> dict[str, Any]:
         "available_daily_count": len(available_rows),
         "available_daily_truncated": len(available_rows) > ATTR_RECENT_ROW_LIMIT,
         "categories": summary.get("categories", []),
+    }
+
+
+def build_global_summary(
+    dashboard_payload: dict[str, Any] | None,
+    balance_payload: dict[str, Any] | None,
+    signup_info_payload: dict[str, Any] | None,
+    *,
+    last_update: float | None,
+    last_failed_update: float | None = None,
+    refresh_error: str | None = None,
+    fetch_errors: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Build a compact global summary consumed by entry-level entities."""
+    dashboard = _payload_data(dashboard_payload) or {}
+    balance = _payload_data(balance_payload) or {}
+    signup_info = _payload_data(signup_info_payload)
+    latest_invoice_raw = dashboard.get("lastestInvoice")
+    latest_invoice: dict[str, Any] = (
+        latest_invoice_raw if isinstance(latest_invoice_raw, dict) else {}
+    )
+    transactions = dashboard.get("recentAccountTransactions")
+    if not isinstance(transactions, list):
+        transactions = []
+
+    balance_value = balance.get("balance")
+    dashboard_balance = dashboard.get("currentBalance")
+
+    return {
+        "balance": (
+            -balance_value if isinstance(balance_value, (int, float)) else balance_value
+        ),
+        "dashboard_balance": (
+            -dashboard_balance
+            if isinstance(dashboard_balance, (int, float))
+            else dashboard_balance
+        ),
+        "latest_invoice_amount": latest_invoice.get("amount"),
+        "latest_invoice": latest_invoice,
+        "dashboard": {
+            "account_id": dashboard.get("accountId"),
+            "account_number": dashboard.get("accountNumber"),
+            "latest_correspondence": dashboard.get("lastestCorrespondence"),
+            "latest_invoice": latest_invoice,
+            "recent_transactions": transactions[:10],
+        },
+        "signup_services": len(signup_info) if isinstance(signup_info, list) else 0,
+        "signup_info": signup_info if isinstance(signup_info, list) else [],
+        "max_refundable_amount": balance.get("maxRefundableAmount"),
+        "show_refundable_amount": balance.get("showRefundableAmount"),
+        "refresh_status": "error" if refresh_error else "ok",
+        "last_successful_refresh": last_update,
+        "last_failed_refresh": last_failed_update,
+        "refresh_error": refresh_error,
+        "fetch_errors": fetch_errors or {},
     }
 
 
@@ -491,18 +551,20 @@ def build_usage_summary(
         rows = []
 
     if not rows:
-        return {
-            "days": 0,
-            "total_usage": None,
-            "latest_day": None,
-            "latest_day_usage": None,
-            "daily": [],
-            "latest_intervals": [],
-            "total_export": None,
-            "latest_day_export": None,
-            "export_daily": [],
-            "registers": [],
-        }
+        return UsageSummary.model_validate(
+            {
+                "days": 0,
+                "total_usage": None,
+                "latest_day": None,
+                "latest_day_usage": None,
+                "daily": [],
+                "latest_intervals": [],
+                "total_export": None,
+                "latest_day_export": None,
+                "export_daily": [],
+                "registers": [],
+            }
+        ).model_dump(mode="json")
 
     import_rows = [r for r in rows if not _is_export_register(r)]
     export_rows = [r for r in rows if _is_export_register(r)]
@@ -510,18 +572,20 @@ def build_usage_summary(
     import_summary = _build_register_summary(import_rows)
     export_summary = _build_register_summary(export_rows)
 
-    return {
-        "days": import_summary["days"],
-        "total_usage": import_summary["total"],
-        "latest_day": import_summary["latest_day"],
-        "latest_day_usage": import_summary["latest_day_usage"],
-        "daily": import_summary["daily"],
-        "latest_intervals": import_summary["latest_intervals"],
-        "total_export": export_summary["total"],
-        "latest_day_export": export_summary["latest_day_usage"],
-        "export_daily": export_summary["daily"],
-        "registers": _build_usage_register_summaries(rows),
-    }
+    return UsageSummary.model_validate(
+        {
+            "days": import_summary["days"],
+            "total_usage": import_summary["total"],
+            "latest_day": import_summary["latest_day"],
+            "latest_day_usage": import_summary["latest_day_usage"],
+            "daily": import_summary["daily"],
+            "latest_intervals": import_summary["latest_intervals"],
+            "total_export": export_summary["total"],
+            "latest_day_export": export_summary["latest_day_usage"],
+            "export_daily": export_summary["daily"],
+            "registers": _build_usage_register_summaries(rows),
+        }
+    ).model_dump(mode="json")
 
 
 def build_gas_reading_summary(
@@ -566,19 +630,21 @@ def build_gas_reading_summary(
 
     latest = history[-1] if history else None
     recent = _recent_rows(history)
-    return {
-        "latest_reading": latest.get("read_index") if latest else None,
-        "latest_reading_date": latest.get("date") if latest else None,
-        "latest_reading_source": latest.get("source") if latest else None,
-        "latest_reading_serial": latest.get("serial") if latest else None,
-        "latest_reading_quality_method": (
-            latest.get("quality_method") if latest else None
-        ),
-        "history": history,
-        "history_recent": recent,
-        "history_count": len(history),
-        "history_truncated": len(history) > ATTR_RECENT_ROW_LIMIT,
-    }
+    return GasReadingSummary.model_validate(
+        {
+            "latest_reading": latest.get("read_index") if latest else None,
+            "latest_reading_date": latest.get("date") if latest else None,
+            "latest_reading_source": latest.get("source") if latest else None,
+            "latest_reading_serial": latest.get("serial") if latest else None,
+            "latest_reading_quality_method": (
+                latest.get("quality_method") if latest else None
+            ),
+            "history": history,
+            "history_recent": recent,
+            "history_count": len(history),
+            "history_truncated": len(history) > ATTR_RECENT_ROW_LIMIT,
+        }
+    ).model_dump(mode="json")
 
 
 def build_cost_summary(cost_payload: dict[str, Any] | None) -> dict[str, Any]:
@@ -652,37 +718,40 @@ def build_cost_summary(cost_payload: dict[str, Any] | None) -> dict[str, Any]:
         )
         latest_day_zerohero_credit = _round(zerohero_total, 2)
 
-    return {
-        "days": len(daily),
-        "total_amount": _round(total_amount, 2),
-        "total_quantity": _round(total_quantity),
-        "latest_day": latest_day,
-        "latest_day_amount": latest_day_amount,
-        "latest_available_day": latest_available_day,
-        "latest_available_day_complete": (
-            latest_available_day is not None and latest_available_day == latest_day
-        ),
-        "latest_day_zerohero_credit": latest_day_zerohero_credit,
-        "latest_day_zerohero_achieved": (
-            latest_day_zerohero_credit is not None and latest_day_zerohero_credit != 0
-        ),
-        "daily": daily,
-        "daily_totals": [
-            {"date": day, "amount": _round(amount, 2)}
-            for day, amount in sorted(daily_totals.items())
-        ],
-        "available_daily": available_daily,
-        "incomplete_days": sorted(set(grouped_rows) - complete_days),
-        "projected_month": _build_projected_month_summary(daily),
-        "categories": [
-            {
-                "chargeCategory": value["chargeCategory"],
-                "amount": _round(value["amount"], 2),
-                "quantity": _round(value["quantity"]),
-            }
-            for _, value in sorted(categories.items())
-        ],
-    }
+    return CostSummary.model_validate(
+        {
+            "days": len(daily),
+            "total_amount": _round(total_amount, 2),
+            "total_quantity": _round(total_quantity),
+            "latest_day": latest_day,
+            "latest_day_amount": latest_day_amount,
+            "latest_available_day": latest_available_day,
+            "latest_available_day_complete": (
+                latest_available_day is not None and latest_available_day == latest_day
+            ),
+            "latest_day_zerohero_credit": latest_day_zerohero_credit,
+            "latest_day_zerohero_achieved": (
+                latest_day_zerohero_credit is not None
+                and latest_day_zerohero_credit != 0
+            ),
+            "daily": daily,
+            "daily_totals": [
+                {"date": day, "amount": _round(amount, 2)}
+                for day, amount in sorted(daily_totals.items())
+            ],
+            "available_daily": available_daily,
+            "incomplete_days": sorted(set(grouped_rows) - complete_days),
+            "projected_month": _build_projected_month_summary(daily),
+            "categories": [
+                {
+                    "chargeCategory": value["chargeCategory"],
+                    "amount": _round(value["amount"], 2),
+                    "quantity": _round(value["quantity"]),
+                }
+                for _, value in sorted(categories.items())
+            ],
+        }
+    ).model_dump(mode="json")
 
 
 def build_latest_data_status(
@@ -724,15 +793,17 @@ def build_latest_data_status(
     else:
         status = "ready"
 
-    return {
-        "status": status,
-        "latest_ready_day": latest_ready_day,
-        "latest_usage_day": latest_usage_day,
-        "latest_cost_day": latest_cost_day,
-        "latest_available_cost_day": latest_available_cost_day,
-        "latest_available_cost_day_complete": latest_available_cost_day_complete,
-        "incomplete_cost_days": cost_summary.get("incomplete_days", []),
-    }
+    return LatestDataStatus.model_validate(
+        {
+            "status": status,
+            "latest_ready_day": latest_ready_day,
+            "latest_usage_day": latest_usage_day,
+            "latest_cost_day": latest_cost_day,
+            "latest_available_cost_day": latest_available_cost_day,
+            "latest_available_cost_day_complete": latest_available_cost_day_complete,
+            "incomplete_cost_days": cost_summary.get("incomplete_days", []),
+        }
+    ).model_dump(mode="json")
 
 
 def all_services_ready_for_day(
@@ -766,7 +837,7 @@ def _build_projected_month_summary(
     today: date | None = None,
 ) -> dict[str, Any]:
     """Project the current calendar month from completed daily cost rows."""
-    today = today or date.today()
+    today = today or datetime.now(UTC).date()
     month_start = today.replace(day=1)
     days_in_month = calendar.monthrange(today.year, today.month)[1]
 
@@ -874,31 +945,33 @@ def build_weather_summary(weather_payload: dict[str, Any] | None) -> dict[str, A
         ):
             latest = row
 
-    return {
-        "days": len(rows),
-        "latest_date": latest.get("dateAsDate") if latest else None,
-        "latest_min_temp": latest.get("obMinTemp") if latest else None,
-        "latest_max_temp": latest.get("obMaxTemp") if latest else None,
-        "daily": [
-            {
-                "dateAsDate": row.get("dateAsDate"),
-                "obMinTemp": row.get("obMinTemp"),
-                "obMaxTemp": row.get("obMaxTemp"),
-                "distanceMeters": row.get("distanceMeters"),
-            }
-            for row in rows
-        ],
-    }
+    return WeatherSummary.model_validate(
+        {
+            "days": len(rows),
+            "latest_date": latest.get("dateAsDate") if latest else None,
+            "latest_min_temp": latest.get("obMinTemp") if latest else None,
+            "latest_max_temp": latest.get("obMaxTemp") if latest else None,
+            "daily": [
+                {
+                    "dateAsDate": row.get("dateAsDate"),
+                    "obMinTemp": row.get("obMinTemp"),
+                    "obMaxTemp": row.get("obMaxTemp"),
+                    "distanceMeters": row.get("distanceMeters"),
+                }
+                for row in rows
+            ],
+        }
+    ).model_dump(mode="json")
 
 
 def date_range_for_usage(
     days: int = DEFAULT_USAGE_DAYS,
 ) -> tuple[str, str, str, str, str, str]:
     """Return slash, dashed, and ISO date ranges for portal endpoints."""
-    today = date.today()
+    today = datetime.now(UTC).date()
     start = today - timedelta(days=days)
-    start_dt = datetime.combine(start, time.min, tzinfo=timezone.utc)
-    end_dt = datetime.combine(today, time.max, tzinfo=timezone.utc)
+    start_dt = datetime.combine(start, time.min, tzinfo=UTC)
+    end_dt = datetime.combine(today, time.max, tzinfo=UTC)
     return (
         start.strftime("%Y/%m/%d"),
         today.strftime("%Y/%m/%d"),
@@ -1058,8 +1131,8 @@ class GloBirdClient:
             }
             if sticky:
                 self._session.cookie_jar.update_cookies(sticky, primary)
-        except Exception:  # noqa: BLE001 - best-effort; login will surface any real error
-            pass
+        except Exception as err:
+            _LOGGER.debug("Unable to pre-establish GloBird session: %s", err)
 
     async def _encrypt_password(self, password: str) -> str:
         """RSA-OAEP (SHA-256) encrypt password using the portal's public JWK."""

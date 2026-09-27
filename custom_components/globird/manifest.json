@@ -1,0 +1,19 @@
+{
+  "domain": "globird",
+  "name": "GloBird",
+  "codeowners": [
+    "@ruaan-deysel"
+  ],
+  "config_flow": true,
+  "dependencies": [
+    "recorder"
+  ],
+  "documentation": "https://github.com/ruaan-deysel/ha-globird",
+  "integration_type": "service",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/ruaan-deysel/ha-globird/issues",
+  "requirements": [
+    "pydantic>=2.13.5"
+  ],
+  "version": "2026.10.0"
+}

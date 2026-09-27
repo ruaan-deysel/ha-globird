@@ -1,0 +1,104 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "GloBird HA",
+        "description": "Enter your GloBird customer portal credentials.",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to GloBird",
+      "invalid_auth": "Invalid GloBird email or password",
+      "captcha_required": "GloBird requires captcha verification, which is not supported by this integration",
+      "unknown": "Unexpected error"
+    },
+    "abort": {
+      "already_configured": "This GloBird account is already configured"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "GloBird HA options",
+        "description": "Set when automatic daily readiness polling resumes after the previous day is ready.",
+        "data": {
+          "daily_poll_start_time": "Daily polling start time"
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "balance": {
+        "name": "Balance"
+      },
+      "dashboard_balance": {
+        "name": "Dashboard Balance"
+      },
+      "latest_invoice": {
+        "name": "Latest Invoice"
+      },
+      "signup_services": {
+        "name": "Signup Services"
+      },
+      "last_successful_refresh": {
+        "name": "Last Successful Refresh"
+      },
+      "refresh_status": {
+        "name": "Refresh Status"
+      },
+      "account_summary": {
+        "name": "Account Summary"
+      },
+      "service_status": {
+        "name": "Service Status"
+      },
+      "meter_info": {
+        "name": "Meter Info"
+      },
+      "latest_data_date": {
+        "name": "Latest Data Date"
+      },
+      "latest_data_status": {
+        "name": "Latest Data Status"
+      },
+      "usage_total": {
+        "name": "Recent Usage Total"
+      },
+      "latest_day_usage": {
+        "name": "Latest Day Usage"
+      },
+      "solar_export_total": {
+        "name": "Recent Solar Export Total"
+      },
+      "latest_day_solar_export": {
+        "name": "Latest Day Solar Export"
+      },
+      "cost_total": {
+        "name": "Recent Cost Total"
+      },
+      "latest_day_cost": {
+        "name": "Latest Daily Cost"
+      },
+      "zerohero_status": {
+        "name": "ZeroHero Status"
+      },
+      "expected_month_cost": {
+        "name": "Expected Monthly Cost"
+      },
+      "billing_period_days": {
+        "name": "Billing Period Days"
+      },
+      "billing_period_cost": {
+        "name": "Billing Period Cost"
+      },
+      "weather_summary": {
+        "name": "Weather Summary"
+      }
+    }
+  }
+}

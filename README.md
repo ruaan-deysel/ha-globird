@@ -10,12 +10,7 @@ It logs in to the GloBird portal and creates sensors for account, usage, cost, g
 
 ### HACS
 
-1. Add `https://github.com/ruaan-deysel/ha-globird` as a custom **Integration** repository.
-2. Install **GloBird**.
-3. Restart Home Assistant.
-4. Add **GloBird** in **Settings > Devices & Services**.
-
-[Open in HACS](https://my.home-assistant.io/redirect/hacs_repository/?owner=ruaan-deysel&repository=ha-globird&category=integration)
+[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=ruaan-deysel&repository=ha-globird&category=integration)
 
 ### Manual
 

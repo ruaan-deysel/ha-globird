@@ -10,6 +10,8 @@ This project uses Home Assistant's calendar versioning scheme (`YYYY.M.P`, for e
 
 ### Changed
 
+- Update repository URLs and documentation references to tinkerologie organization.
+
 ### Fixed
 
 ## [2026.10.2] - 2026-09-28
@@ -40,6 +42,8 @@ This project uses Home Assistant's calendar versioning scheme (`YYYY.M.P`, for e
   - Added `.github/workflows/release.yaml` to monitor `custom_components/globird/manifest.json` and `CHANGELOG.md`, validate Home Assistant versioning (`YYYY.M.P`), and automatically publish GitHub Releases with extracted changelog notes.
 
 ### Changed
+
+- Update repository URLs and documentation references to tinkerologie organization.
 - **Client Architecture & Pydantic v2**:
   - Renamed `custom_components/globird/api/api.py` to `custom_components/globird/api/client.py` and exposed `custom_components/globird/client.py`.
   - Upgraded `custom_components/globird/api/models.py` to use Pydantic v2 (`ConfigDict`, `@field_validator`, `Literal` types, `CostDailyTotalRow`, `BillingPeriodProjection`, and import/export cost breakdown fields).

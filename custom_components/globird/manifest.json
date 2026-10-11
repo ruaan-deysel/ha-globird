@@ -8,10 +8,10 @@
   "dependencies": [
     "recorder"
   ],
-  "documentation": "https://github.com/ruaan-deysel/ha-globird",
+  "documentation": "https://github.com/tinkerologie/ha-globird",
   "integration_type": "service",
   "iot_class": "cloud_polling",
-  "issue_tracker": "https://github.com/ruaan-deysel/ha-globird/issues",
+  "issue_tracker": "https://github.com/tinkerologie/ha-globird/issues",
   "quality_scale": "platinum",
   "requirements": [
     "pydantic>=2.0.0"

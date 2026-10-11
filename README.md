@@ -24,10 +24,10 @@ The **GloBird** custom integration connects your [GloBird Energy](https://www.gl
 
 ### Option 1: HACS (Recommended)
 
-[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=ruaan-deysel&repository=ha-globird&category=integration)
+[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=tinkerologie&repository=ha-globird&category=integration)
 
 1. Open **HACS** in Home Assistant.
-2. Add `https://github.com/ruaan-deysel/ha-globird` as a custom **Integration** repository.
+2. Add `https://github.com/tinkerologie/ha-globird` as a custom **Integration** repository.
 3. Install **GloBird** and restart Home Assistant.
 4. Go to **Settings > Devices & Services > Add Integration** and search for **GloBird**.
 

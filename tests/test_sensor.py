@@ -695,16 +695,21 @@ def test_gas_upload_rebases_legacy_rows_outside_window(monkeypatch: Any) -> None
     assert [row["sum"] for row in rows] == [0.0, 30.0, 46.0, 90.0]
 
 
-def test_gas_upload_ignores_stored_row_without_sum(monkeypatch: Any) -> None:
-    """A stored row without state or sum cannot anchor the import."""
-    uploaded, _queries = _install_gas_recorder_stubs(
-        monkeypatch, [{"start": 1.0, "state": 700.0, "sum": None}]
-    )
-    entity = _gas_reading_entity(_GAS_HISTORY)
+def test_gas_upload_ignores_stored_rows_without_state_or_sum(
+    monkeypatch: Any,
+) -> None:
+    """A stored row without a state or a sum cannot anchor the import."""
+    for stored_row in (
+        {"start": 1.0, "state": 700.0, "sum": None},
+        {"start": 1.0, "state": None, "sum": 100.0},
+    ):
+        uploaded, _queries = _install_gas_recorder_stubs(monkeypatch, [stored_row])
+        entity = _gas_reading_entity(_GAS_HISTORY)
 
-    asyncio.run(entity._async_upload_historical_statistics())
+        asyncio.run(entity._async_upload_historical_statistics())
 
-    assert [row["sum"] for row in uploaded[0][1]] == [0.0, 44.0]
+        assert len(uploaded) == 1
+        assert [row["sum"] for row in uploaded[0][1]] == [0.0, 44.0]
 
 
 def test_gas_upload_skipped_when_stored_rows_unreadable(monkeypatch: Any) -> None:

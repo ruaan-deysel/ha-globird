@@ -422,7 +422,7 @@ def test_gas_statistics_continue_across_meter_replacement() -> None:
     )
 
     assert [row["state"] for row in statistics] == [100.0, 110.0, 5.0, 12.0]
-    assert [row["sum"] for row in statistics] == [100.0, 110.0, 110.0, 117.0]
+    assert [row["sum"] for row in statistics] == [0.0, 10.0, 10.0, 17.0]
     assert statistics[0]["start"].utcoffset() == timedelta(hours=10)
 
 
@@ -437,7 +437,306 @@ def test_gas_statistics_ignore_downward_correction_without_double_counting() -> 
         tzinfo=UTC,
     )
 
-    assert [row["sum"] for row in statistics] == [100.0, 100.0, 102.0]
+    assert [row["sum"] for row in statistics] == [0.0, 0.0, 2.0]
+
+
+def test_gas_statistics_first_read_starts_sum_at_zero() -> None:
+    """The first meter index is a baseline, not consumption.
+
+    Home Assistant's recorder computes change for the first-ever statistics
+    row as ``sum - 0``, so a first sum equal to the meter index would show the
+    whole index as consumed in the Energy dashboard.
+    """
+    statistics = sensor._build_gas_statistics(
+        [
+            {"date": "2026-01-01", "read_index": 746.0, "serial": "meter"},
+            {"date": "2026-04-01", "read_index": 790.5, "serial": "meter"},
+        ],
+        tzinfo=UTC,
+    )
+
+    assert [row["state"] for row in statistics] == [746.0, 790.5]
+    assert [row["sum"] for row in statistics] == [0.0, 44.5]
+
+
+def test_gas_statistics_single_read_has_zero_sum() -> None:
+    """A single published read yields a zero sum with the index as state."""
+    statistics = sensor._build_gas_statistics(
+        [{"date": "2026-01-01", "read_index": 790.0, "serial": "meter"}],
+        tzinfo=UTC,
+    )
+
+    assert len(statistics) == 1
+    assert statistics[0]["state"] == 790.0
+    assert statistics[0]["sum"] == 0.0
+
+
+def test_gas_statistics_new_serial_first_read_is_baseline() -> None:
+    """A replacement meter's first read is its baseline and adds no usage."""
+    statistics = sensor._build_gas_statistics(
+        [
+            {"date": "2026-01-01", "read_index": 500.0, "serial": "old"},
+            {"date": "2026-02-01", "read_index": 520.0, "serial": "old"},
+            {"date": "2026-03-01", "read_index": 900.0, "serial": "new"},
+            {"date": "2026-04-01", "read_index": 930.0, "serial": "new"},
+        ],
+        tzinfo=UTC,
+    )
+
+    assert [row["sum"] for row in statistics] == [0.0, 20.0, 20.0, 50.0]
+
+
+def test_gas_statistics_continue_from_stored_row_before_window() -> None:
+    """Reads that left the portal window must not reset the sum to 0."""
+    statistics = sensor._build_gas_statistics(
+        [
+            {"date": "2026-04-01", "read_index": 790.0, "serial": "meter"},
+            {"date": "2026-07-01", "read_index": 830.0, "serial": "meter"},
+        ],
+        tzinfo=UTC,
+        stored_before=(746.0, 0.0),
+    )
+
+    assert [row["state"] for row in statistics] == [790.0, 830.0]
+    assert [row["sum"] for row in statistics] == [44.0, 84.0]
+
+
+def test_gas_statistics_stored_row_with_higher_index_adds_no_usage() -> None:
+    """A first read below the stored index keeps the stored sum."""
+    statistics = sensor._build_gas_statistics(
+        [
+            {"date": "2026-04-01", "read_index": 10.0, "serial": "new"},
+            {"date": "2026-07-01", "read_index": 25.0, "serial": "new"},
+        ],
+        tzinfo=UTC,
+        stored_before=(900.0, 50.0),
+    )
+
+    assert [row["sum"] for row in statistics] == [50.0, 65.0]
+
+
+def test_daily_cumulative_statistics_first_row_is_first_day_usage() -> None:
+    """Daily rows are per-day usage, so the first sum is that day's usage."""
+    statistics = sensor._build_daily_cumulative_statistics(
+        [
+            {"readDate": "2026-09-26", "usage": 3.5},
+            {"readDate": "2026-09-27", "usage": 4.25},
+        ],
+        date_key="readDate",
+        value_key="usage",
+        tzinfo=UTC,
+    )
+
+    assert [row["state"] for row in statistics] == [3.5, 4.25]
+    assert [row["sum"] for row in statistics] == [3.5, 7.75]
+
+
+def _gas_reading_entity(summary: dict[str, Any]) -> Any:
+    """Return a Latest Gas Reading entity backed by the given summary."""
+
+    class FakeCoordinator:
+        data = {
+            "service_data": {
+                "123": {
+                    "service": {"accountServiceId": 123, "serviceType": "Gas"},
+                    "gas_reading_summary": summary,
+                }
+            }
+        }
+
+    return sensor.GloBirdLatestGasReadingSensor(
+        FakeCoordinator(),
+        types.SimpleNamespace(entry_id="entry-1"),
+        {"accountServiceId": 123, "serviceType": "Gas"},
+    )
+
+
+def test_latest_gas_reading_is_unknown_without_reads() -> None:
+    """A gas service with no published reads must report unknown, not 0.0."""
+    assert _gas_reading_entity({}).native_value is None
+    assert _gas_reading_entity({"latest_reading": None}).native_value is None
+
+
+def test_latest_gas_reading_keeps_real_zero_reading() -> None:
+    """A real 0.0 meter index is a reading, not a missing value."""
+    assert _gas_reading_entity({"latest_reading": 0.0}).native_value == 0.0
+
+
+def _install_gas_recorder_stubs(
+    monkeypatch: Any,
+    stored_rows: list[dict[str, Any]] | Exception,
+) -> tuple[list[tuple[Any, Any]], list[tuple[Any, ...]]]:
+    """Stub the recorder APIs the gas statistics import uses."""
+    uploaded: list[tuple[Any, Any]] = []
+    queries: list[tuple[Any, ...]] = []
+
+    async def add_statistics(_hass: Any, meta: Any, stats: Any) -> None:
+        uploaded.append((meta, stats))
+
+    def statistics_during_period(*args: Any) -> dict[str, list[dict[str, Any]]]:
+        queries.append(args)
+        if isinstance(stored_rows, Exception):
+            raise stored_rows
+        return {args[3].copy().pop(): stored_rows}
+
+    class FakeRecorder:
+        async def async_add_executor_job(self, func: Any, *args: Any) -> Any:
+            return func(*args)
+
+    statistics_module = types.ModuleType("homeassistant.components.recorder.statistics")
+    statistics_module.async_add_external_statistics = add_statistics
+    statistics_module.statistics_during_period = statistics_during_period
+    helpers_recorder = types.ModuleType("homeassistant.helpers.recorder")
+    helpers_recorder.get_instance = lambda _hass: FakeRecorder()
+    monkeypatch.setitem(
+        sys.modules,
+        "homeassistant.components.recorder.statistics",
+        statistics_module,
+    )
+    monkeypatch.setitem(sys.modules, "homeassistant.helpers.recorder", helpers_recorder)
+    return uploaded, queries
+
+
+_GAS_HISTORY = {
+    "latest_reading": 790.0,
+    "history": [
+        {"date": "2026-01-01", "read_index": 746.0, "serial": "meter"},
+        {"date": "2026-04-01", "read_index": 790.0, "serial": "meter"},
+    ],
+}
+
+
+def test_gas_upload_first_import_starts_sum_at_zero(monkeypatch: Any) -> None:
+    """First import: the uploaded sum starts at 0 with the index as state."""
+    uploaded, queries = _install_gas_recorder_stubs(monkeypatch, [])
+    entity = _gas_reading_entity(_GAS_HISTORY)
+
+    asyncio.run(entity._async_upload_historical_statistics())
+
+    assert len(uploaded) == 1
+    metadata, rows = uploaded[0]
+    assert metadata["has_sum"] is True
+    assert (
+        metadata["statistic_id"]
+        == f"{sensor.DOMAIN}:entry_1_service_123_latest_gas_reading"
+    )
+    assert metadata["unit_of_measurement"] == sensor.UnitOfVolume.CUBIC_METERS
+    assert [row["state"] for row in rows] == [746.0, 790.0]
+    assert [row["sum"] for row in rows] == [0.0, 44.0]
+    assert queries[0][3] == {metadata["statistic_id"]}
+    assert queries[0][2] == rows[0]["start"]
+    assert queries[0][6] == {"state", "sum"}
+
+
+def test_gas_upload_continues_from_stored_row(monkeypatch: Any) -> None:
+    """A stored row before the window anchors the uploaded sums."""
+    uploaded, _queries = _install_gas_recorder_stubs(
+        monkeypatch,
+        [
+            {"start": 1.0, "state": 600.0, "sum": 0.0},
+            {"start": 2.0, "state": 700.0, "sum": 100.0},
+        ],
+    )
+    entity = _gas_reading_entity(_GAS_HISTORY)
+
+    asyncio.run(entity._async_upload_historical_statistics())
+
+    assert [row["sum"] for row in uploaded[0][1]] == [146.0, 190.0]
+
+
+def test_rebase_legacy_gas_rows_removes_initial_index() -> None:
+    """Rows stored with the old index-based sum are rebased to start at 0."""
+    start = datetime(2025, 10, 1, tzinfo=UTC)
+    rebased = sensor._rebase_legacy_gas_rows(
+        [
+            {"start": start, "state": 700.0, "sum": 700.0},
+            {"start": start + timedelta(days=60), "state": 730.0, "sum": 730.0},
+        ]
+    )
+
+    assert [row["start"] for row in rebased] == [start, start + timedelta(days=60)]
+    assert [row["state"] for row in rebased] == [700.0, 730.0]
+    assert [row["sum"] for row in rebased] == [0.0, 30.0]
+
+
+def test_rebase_legacy_gas_rows_leaves_current_rows_alone() -> None:
+    """Rows without a legacy offset, or no rows, need no rebase."""
+    start = datetime(2025, 10, 1, tzinfo=UTC)
+    assert sensor._rebase_legacy_gas_rows([]) == []
+    assert (
+        sensor._rebase_legacy_gas_rows([{"start": start, "state": 700.0, "sum": 0.0}])
+        == []
+    )
+    assert (
+        sensor._rebase_legacy_gas_rows([{"start": start, "state": 0.0, "sum": 0.0}])
+        == []
+    )
+
+
+def test_gas_upload_rebases_legacy_rows_outside_window(monkeypatch: Any) -> None:
+    """Legacy rows outside the window are rewritten once without the index."""
+    first = datetime(2025, 10, 1, tzinfo=UTC)
+    second = datetime(2025, 12, 1, tzinfo=UTC)
+    uploaded, _queries = _install_gas_recorder_stubs(
+        monkeypatch,
+        [
+            {"start": first.timestamp(), "state": 700.0, "sum": 700.0},
+            {"start": second.timestamp(), "state": 730.0, "sum": 730.0},
+        ],
+    )
+    entity = _gas_reading_entity(_GAS_HISTORY)
+
+    asyncio.run(entity._async_upload_historical_statistics())
+
+    rows = uploaded[0][1]
+    assert rows[0]["start"] == first
+    assert rows[1]["start"] == second
+    assert [row["state"] for row in rows] == [700.0, 730.0, 746.0, 790.0]
+    assert [row["sum"] for row in rows] == [0.0, 30.0, 46.0, 90.0]
+
+
+def test_gas_upload_ignores_stored_rows_without_state_or_sum(
+    monkeypatch: Any,
+) -> None:
+    """A stored row without a state or a sum cannot anchor the import."""
+    for stored_row in (
+        {"start": 1.0, "state": 700.0, "sum": None},
+        {"start": 1.0, "state": None, "sum": 100.0},
+    ):
+        uploaded, _queries = _install_gas_recorder_stubs(monkeypatch, [stored_row])
+        entity = _gas_reading_entity(_GAS_HISTORY)
+
+        asyncio.run(entity._async_upload_historical_statistics())
+
+        assert len(uploaded) == 1
+        assert [row["sum"] for row in uploaded[0][1]] == [0.0, 44.0]
+
+
+def test_gas_upload_skipped_when_stored_rows_unreadable(monkeypatch: Any) -> None:
+    """Rows are never rewritten when the stored anchor cannot be read."""
+    uploaded, _queries = _install_gas_recorder_stubs(
+        monkeypatch, RuntimeError("database locked")
+    )
+    entity = _gas_reading_entity(_GAS_HISTORY)
+
+    asyncio.run(entity._async_upload_historical_statistics())
+
+    assert uploaded == []
+
+
+def test_latest_gas_reading_has_no_state_class() -> None:
+    """The meter index entity must not compile its own long-term statistics.
+
+    The imported ``globird:`` external statistic is the Energy dashboard
+    source; a recorder-compiled sum on a quarterly index books each read
+    jump into a single hour.
+    """
+    entity = _gas_reading_entity({"latest_reading": 790.0})
+
+    assert entity._attr_state_class is None
+    assert entity._attr_device_class == sensor.SensorDeviceClass.GAS
+    assert entity._attr_native_unit_of_measurement == sensor.UnitOfVolume.CUBIC_METERS
+    assert entity.native_value == 790.0
 
 
 def test_latest_gas_reading_sensor_exposes_reading_summary() -> None:
@@ -808,7 +1107,16 @@ def test_gas_statistics_import_paths(monkeypatch: Any) -> None:
     recorder_statistics.StatisticData = StatisticData
     recorder_statistics.StatisticMetaData = StatisticMetaData
     recorder_statistics.async_add_external_statistics = add_ok
+    recorder_statistics.statistics_during_period = lambda *_args: {}
     sys.modules["homeassistant.components.recorder.statistics"] = recorder_statistics
+
+    class FakeRecorder:
+        async def async_add_executor_job(self, func: Any, *args: Any) -> Any:
+            return func(*args)
+
+    helpers_recorder = types.ModuleType("homeassistant.helpers.recorder")
+    helpers_recorder.get_instance = lambda _hass: FakeRecorder()
+    monkeypatch.setitem(sys.modules, "homeassistant.helpers.recorder", helpers_recorder)
 
     asyncio.run(entity._async_upload_historical_statistics())
 

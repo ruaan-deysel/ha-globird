@@ -86,7 +86,8 @@ Go to **Settings > Dashboards > Energy** to configure usage and cost tracking:
 
 ### 3. Gas Consumption & Costs
 - **Gas Usage**:
-  - Select `sensor.glo_bird_energy_latest_gas_reading_<mirn>` (*Latest Gas Reading*) or the backfilled external statistic `globird:<entry>_service_<id>_latest_gas_reading` (`m³`).
+  - Select the external statistic `globird:<entry>_service_<id>_latest_gas_reading` (`m³`), named *Latest Gas Reading (<mirn>)*. The integration imports every published meter read into it, and its sum starts at 0 at the first read, so only gas used between reads counts.
+  - Do not select the `sensor.glo_bird_energy_latest_gas_reading_<mirn>` entity. It shows the current meter index, has no state class, and does not record long-term statistics: basic gas meters are read about every three months, so the entity cannot produce correct hourly usage. It is `unknown` until the first read is published.
 - **Gas Cost**:
   - Select `sensor.glo_bird_energy_billing_period_cost_<mirn>` (*Billing Period Cost*) or `sensor.glo_bird_energy_recent_cost_total_<mirn>` (*Recent Cost Total*).
 
@@ -112,7 +113,7 @@ Go to **Settings > Dashboards > Energy** to configure usage and cost tracking:
 - **Recent Solar Export Credit Total** & **Latest Daily Solar Export Credit** (`AUD`, `monetary`, `total`) — Solar feed-in credit totals.
 - **Expected Monthly Cost** (`AUD`, `monetary`) & **Billing Period Days** — Billing cycle cost projection.
 - **ZeroHero Status** (`enum`: `achieved`, `missed`, `pending`, `awaiting_result`, `unknown`) — Daily ZeroHero credit status.
-- **Latest Gas Reading** (`m³`, `gas`, `total_increasing`) & **Latest Gas Reading Date** (`diagnostic`).
+- **Latest Gas Reading** (`m³`, `gas`, no state class; `unknown` until the first read) & **Latest Gas Reading Date** (`diagnostic`). Gas usage for the Energy dashboard comes from the `globird:` external statistic (see *Gas Consumption & Costs*).
 - **Weather Summary** (`°C`, `temperature`, `measurement`) — Daily min/max temperatures for the service postcode.
 
 ---

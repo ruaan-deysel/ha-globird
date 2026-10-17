@@ -526,11 +526,10 @@ def _build_register_summary(
         if existing is None:
             by_date[d]["intervals"] = list(arr)
         else:
+            # Channels can report different lengths; keep every interval.
+            existing.extend([0.0] * (len(arr) - len(existing)))
             for i, v in enumerate(arr):
-                if i < len(existing):
-                    existing[i] = (_as_float(existing[i]) or 0.0) + (
-                        _as_float(v) or 0.0
-                    )
+                existing[i] = (_as_float(existing[i]) or 0.0) + (_as_float(v) or 0.0)
 
     total = sum(v["usage"] for v in by_date.values())
     latest_date = max(by_date) if by_date else None

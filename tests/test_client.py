@@ -716,7 +716,7 @@ def test_usage_summary_sums_intervals_that_differ_per_row() -> None:
 
     assert usage["latest_intervals"] == [1.0, 2.0]
 
-    # A longer array from another channel only adds to existing intervals.
+    # A longer array from another channel keeps its extra intervals.
     longer = build_usage_summary(
         {
             "data": [
@@ -737,7 +737,7 @@ def test_usage_summary_sums_intervals_that_differ_per_row() -> None:
             ]
         }
     )
-    assert longer["latest_intervals"] == [1.5]
+    assert longer["latest_intervals"] == [1.5, 9.0]
 
 
 def test_cost_usage_quantities_match_energy_registers_live_shape() -> None:

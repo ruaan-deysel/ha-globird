@@ -62,6 +62,8 @@ ZEROHERO_STATUS_OPTIONS: list[str] = [
 ZEROHERO_RESULT_CUTOFF = dt_time(hour=21)
 # Earliest time searched for stored statistics rows.
 STATISTICS_EPOCH = datetime(2000, 1, 1, tzinfo=UTC)
+# Longest wait for the recorder to commit an import before the next upload.
+RECORDER_COMMIT_TIMEOUT = 60
 
 
 def _latest_data_status(detail: dict[str, Any]) -> dict[str, Any]:
@@ -1002,6 +1004,34 @@ class GloBirdServiceBaseSensor(GloBirdBaseSensor):
         except Exception as err:
             _LOGGER.warning(
                 "GloBird external statistics import skipped for %s (%s): %s",
+                self._service_id,
+                statistic_id,
+                err,
+            )
+            return
+        await self._async_wait_for_statistics_commit(statistic_id)
+
+    async def _async_wait_for_statistics_commit(self, statistic_id: str) -> None:
+        """Wait until the recorder has committed the queued statistics import.
+
+        ``async_add_external_statistics`` only queues an import task. The
+        recorder runs its queue in order, and a commit future resolves once
+        every task queued before it has run and been committed, so the next
+        upload's stored-row lookup sees these rows. An import the recorder
+        queues again after a database error runs after the future; the next
+        refresh uploads the window again. The wait is bounded so a stuck
+        recorder cannot hold the upload lock forever.
+        """
+        from homeassistant.helpers.recorder import get_instance
+
+        try:
+            future = get_instance(self.hass).async_get_commit_future()
+            if future is not None:
+                async with asyncio.timeout(RECORDER_COMMIT_TIMEOUT):
+                    await future
+        except Exception as err:
+            _LOGGER.debug(
+                "GloBird statistics import for %s (%s) not confirmed as committed: %r",
                 self._service_id,
                 statistic_id,
                 err,

@@ -619,6 +619,9 @@ def _install_recorder_stubs(
         async def async_add_executor_job(self, func: Any, *args: Any) -> Any:
             return func(*args)
 
+        def async_get_commit_future(self) -> Any:
+            return None
+
     statistics_module = types.ModuleType("homeassistant.components.recorder.statistics")
     statistics_module.async_add_external_statistics = add_statistics
     statistics_module.statistics_during_period = statistics_during_period
@@ -1813,3 +1816,59 @@ def test_daily_statistics_uploads_run_one_at_a_time() -> None:
     asyncio.run(run_two())
 
     assert events == ["start", "end", "start", "end"]
+
+
+def test_daily_upload_waits_for_recorder_commit(monkeypatch: Any) -> None:
+    """The upload waits for the queued import to commit before returning."""
+    _install_recorder_stubs(monkeypatch, [])
+    events: list[str] = []
+
+    async def run() -> None:
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+
+        class Recorder:
+            async def async_add_executor_job(self, func: Any, *args: Any) -> Any:
+                return func(*args)
+
+            def async_get_commit_future(self) -> Any:
+                events.append("commit requested")
+                loop.call_soon(
+                    lambda: (events.append("committed"), future.set_result(None))
+                )
+                return future
+
+        sys.modules["homeassistant.helpers.recorder"].get_instance = lambda _hass: (
+            Recorder()
+        )
+        await _usage_total_entity(_DAILY)._async_upload_statistics()
+        events.append("upload returned")
+
+    asyncio.run(run())
+
+    assert events == ["commit requested", "committed", "upload returned"]
+
+
+def test_daily_upload_commit_wait_is_bounded(monkeypatch: Any) -> None:
+    """A recorder that never commits does not block the upload forever."""
+    uploaded, _queries = _install_recorder_stubs(monkeypatch, [])
+    monkeypatch.setattr(sensor, "RECORDER_COMMIT_TIMEOUT", 0)
+
+    async def run() -> None:
+        never = asyncio.get_running_loop().create_future()
+
+        class Recorder:
+            async def async_add_executor_job(self, func: Any, *args: Any) -> Any:
+                return func(*args)
+
+            def async_get_commit_future(self) -> Any:
+                return never
+
+        sys.modules["homeassistant.helpers.recorder"].get_instance = lambda _hass: (
+            Recorder()
+        )
+        await _usage_total_entity(_DAILY)._async_upload_statistics()
+
+    asyncio.run(run())
+
+    assert len(uploaded) == 1

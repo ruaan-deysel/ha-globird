@@ -6,6 +6,8 @@ This project uses Home Assistant's calendar versioning scheme (`YYYY.M.P`, for e
 
 ## [Unreleased]
 
+## [2026.10.3] - 2026-10-17
+
 ### Added
 
 - Sensors and long-term statistics per usage register ([#18](https://github.com/tinkerologie/ha-globird/issues/18)): when a service has more than one register of the same kind, such as the `E1` *Offpeak*, *Peak* and *Shoulder* time-of-use windows or the two `B1` feed-in windows, each gets a *Recent `<register>`* sensor (kWh) with its `time_periods`, and a `globird:<entry>_service_<id>_register_<register>` statistic for the Energy dashboard. Flat-rate accounts get no new sensors. Sensors are added when the portal starts returning a register and become unavailable if it stops.

@@ -75,12 +75,19 @@ Go to **Settings > Dashboards > Energy** to configure usage and cost tracking:
 ### 1. Electricity Grid Consumption & Costs
 - **Consumed Energy (`Grid consumption`)**:
   - Select `sensor.glo_bird_energy_recent_usage_total` (*Recent Usage Total*) or `sensor.glo_bird_energy_latest_day_usage` (*Latest Day Usage*), **or** the backfilled external statistic `globird:<entry>_service_<id>_usage_total`.
+  - **Controlled load**: if your account has a controlled-load register, also add `globird:<entry>_service_<id>_controlled_load_total` (*Recent Controlled Load Total*) as a second grid consumption source. It is not part of *Recent Usage Total*.
+  - **Time-of-use windows** (optional): instead of the usage total, you can add one grid consumption source per register statistic, `globird:<entry>_service_<id>_register_<register>` (for example `..._register_e1_peak_usage`), each with its own price. Use either the total or the registers, never both, or usage is counted twice.
 - **Cost Tracking (`Use an entity tracking the total costs`)**:
   - Select `sensor.glo_bird_energy_billing_period_cost` (*Billing Period Cost*), `sensor.glo_bird_energy_recent_cost_total` (*Recent Cost Total*), or `sensor.glo_bird_energy_latest_daily_cost` (*Latest Daily Cost*).
 
 ### 2. Solar Export (`Return to grid`) & Feed-in Compensation
 - **Returned Energy (`Return to grid`)**:
-  - Select `sensor.glo_bird_energy_recent_solar_export_total` (*Recent Solar Export Total*) or `sensor.glo_bird_energy_latest_day_solar_export` (*Latest Day Solar Export*).
+  - Select `sensor.glo_bird_energy_recent_solar_export_total` (*Recent Solar Export Total*) or `sensor.glo_bird_energy_latest_day_solar_export` (*Latest Day Solar Export*). Plans with several feed-in windows also get one `globird:<entry>_service_<id>_register_<register>` statistic per window; as above, use either the total or the windows.
+
+### How usage registers are counted
+The portal returns one row per meter register and day (`E1` import, `B1` export, and so on). Only rows whose `chargeCategoryCode` is an energy category count towards the usage, export and controlled-load totals: `USAGE`, `CONTROL`, `CLIMATE` and `SOLAR` (the same list GloBird's own portal totals), plus rows without a category. Other rows, such as ZEROHERO's `ZeroHero` (`LOW_USAGE_REWARD_PER_DAY`, 18:00–21:00) and `Super Export top up` (`ADDON_FEED_IN`, 18:00–21:00), only re-report part of a time-of-use window for a reward, so they are listed in the `registers` attribute with `usage_class: tracking` but not added to any total. Rows with category `CONTROL` are controlled load; every other import row is general import.
+
+The daily `globird:` statistics are imported again on every refresh for the last 31 days the portal returns. Each import continues the running total from the last stored row before that window, so older days stay in your long-term statistics after the portal stops returning them.
 - **Compensation (`Use an entity tracking total compensation`)**:
   - Select `sensor.glo_bird_energy_recent_solar_export_credit_total` (*Recent Solar Export Credit Total*) or `sensor.glo_bird_energy_latest_daily_solar_export_credit` (*Latest Daily Solar Export Credit*).
 
@@ -107,8 +114,10 @@ Go to **Settings > Dashboards > Energy** to configure usage and cost tracking:
 - **Service Status** (`diagnostic`) — Portal status (e.g. `Switched`, `PendingSwitchResults`, `Active`).
 - **Meter Info** (`diagnostic`) — Selected meter read type (`SMART` / `BASIC`) and serial metadata.
 - **Latest Data Date** & **Latest Data Status** (`diagnostic`) — Readiness state (`ready`, `waiting_for_cost`, `waiting_for_usage`, `no_data`).
-- **Recent Usage Total** & **Latest Day Usage** (`kWh`, `energy`, `total`) — Grid import usage (`E1`).
-- **Recent Solar Export Total** & **Latest Day Solar Export** (`kWh`, `energy`, `total`) — Solar feed-in export (`B1`).
+- **Recent Usage Total** & **Latest Day Usage** (`kWh`, `energy`, `total`) — General grid import usage (`E1`), without reward/add-on tracking rows and without controlled load.
+- **Recent Solar Export Total** & **Latest Day Solar Export** (`kWh`, `energy`, `total`) — Solar feed-in export (`B1`), without add-on tracking rows such as *Super Export top up*.
+- **Recent Controlled Load Total** & **Latest Day Controlled Load** (`kWh`, `energy`, `total`) — Created only for services whose portal data has a controlled-load (`CONTROL`) register.
+- **Recent `<register>`** (`kWh`, `energy`, `total`), for example *Recent E1 Peak Usage* or *Recent B1 Solar/Generation Feed in (4pm-11pm)* — One sensor per register when a service has more than one register of the same kind (time-of-use import windows, feed-in windows, several controlled loads). Flat-rate accounts get none. Attributes include the register's `time_periods` (for example `12:00`–`15:00` for a free or off-peak window), `latest_day`, `latest_day_usage` and the last seven days. The sensor is created when the portal first returns the register and is unavailable while the portal stops returning it; delete it yourself if your plan no longer has that register.
 - **Recent Cost Total**, **Latest Daily Cost**, & **Billing Period Cost** (`AUD`, `monetary`, `total`) — Net service cost totals.
 - **Recent Solar Export Credit Total** & **Latest Daily Solar Export Credit** (`AUD`, `monetary`, `total`) — Solar feed-in credit totals.
 - **Expected Monthly Cost** (`AUD`, `monetary`) & **Billing Period Days** — Billing cycle cost projection.

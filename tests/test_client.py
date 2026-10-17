@@ -14,6 +14,9 @@ from pathlib import Path
 from typing import Any
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "globird_responses.json"
+ZEROHERO_FIXTURE_PATH = (
+    Path(__file__).parent / "fixtures" / "globird_zerohero_tou_responses.json"
+)
 GAS_FIXTURE_PATH = Path(__file__).parent / "fixtures" / "globird_gas_responses.json"
 COMPONENT_PATH = Path(__file__).parents[1] / "custom_components"
 INTEGRATION_PATH = COMPONENT_PATH / "globird"
@@ -54,6 +57,11 @@ def load_fixtures() -> dict[str, Any]:
 def load_gas_fixtures() -> dict[str, Any]:
     """Load dedicated gas fixture payloads."""
     return json.loads(GAS_FIXTURE_PATH.read_text())
+
+
+def load_zerohero_fixtures() -> dict[str, Any]:
+    """Load redacted live ZEROHERO time-of-use payloads (three days)."""
+    return json.loads(ZEROHERO_FIXTURE_PATH.read_text())
 
 
 class FakeResponse:
@@ -580,8 +588,11 @@ def test_usage_summary_tracks_all_registers_and_b_exports() -> None:
 
     usage = build_usage_summary(payload)
 
-    assert usage["total_usage"] == 4.0
-    assert usage["latest_day_usage"] == 4.0
+    # E2 / CONTROL is controlled load: kept out of general import (#19).
+    assert usage["total_usage"] == 3.0
+    assert usage["latest_day_usage"] == 3.0
+    assert usage["total_controlled_load"] == 1.0
+    assert usage["latest_day_controlled_load"] == 1.0
     assert usage["total_export"] == 3.4
     assert usage["latest_day_export"] == 3.4
     assert [register["key"] for register in usage["registers"]] == [
@@ -592,6 +603,7 @@ def test_usage_summary_tracks_all_registers_and_b_exports() -> None:
     ]
     assert usage["registers"][0]["direction"] == "export"
     assert usage["registers"][2]["chargeCategoryCode"] == "CONTROL"
+    assert usage["registers"][2]["usage_class"] == "controlled_load"
     assert usage["registers"][3]["direction"] == "export"
 
 
@@ -629,6 +641,296 @@ def test_usage_summary_keeps_solar_soak_import_register_out_of_export() -> None:
     assert [register["direction"] for register in usage["registers"]] == [
         "export",
         "import",
+    ]
+
+
+def _registers_by_key(usage: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Return usage summary registers keyed by their portal key."""
+    return {register["key"]: register for register in usage["registers"]}
+
+
+def test_usage_summary_excludes_zerohero_reward_registers_live_shape() -> None:
+    """ZeroHero and Super Export top up rows are subsets, not extra energy (#17)."""
+    usage = build_usage_summary(load_zerohero_fixtures()["electricity_usage"])
+
+    # Only the USAGE / SOLAR rows count; they match the portal cost quantities.
+    assert usage["total_usage"] == 0.929
+    assert usage["latest_day"] == "2026/10/16"
+    assert usage["latest_day_usage"] == 0.19
+    assert [row["usage"] for row in usage["daily"]] == [0.489, 0.25, 0.19]
+    assert usage["total_export"] == 48.173
+    assert usage["latest_day_export"] == 22.43
+    assert [row["usage"] for row in usage["export_daily"]] == [14.718, 11.025, 22.43]
+    assert usage["total_controlled_load"] is None
+    assert usage["controlled_load_daily"] == []
+
+    registers = _registers_by_key(usage)
+    zerohero = registers["E1-ZeroHero"]
+    assert zerohero["usage_class"] == "tracking"
+    assert zerohero["direction"] == "import"
+    assert zerohero["chargeCategoryCode"] == "LOW_USAGE_REWARD_PER_DAY"
+    assert zerohero["total"] == 0.241
+    assert zerohero["register_sensor"] is False
+    top_up = registers["B1-Super Export top up"]
+    assert top_up["usage_class"] == "tracking"
+    assert top_up["direction"] == "export"
+    assert top_up["total"] == 0.095
+    assert registers["E1-Peak Usage"]["usage_class"] == "general_import"
+    assert registers["B1-Solar/Generation Feed in (4pm-11pm)"]["usage_class"] == (
+        "export"
+    )
+
+
+def test_usage_summary_latest_intervals_count_each_meter_channel_once() -> None:
+    """Every row repeats its register's full-day usageArray; sum it once."""
+    usage = build_usage_summary(load_zerohero_fixtures()["electricity_usage"])
+
+    assert len(usage["latest_intervals"]) == 288
+    assert round(sum(usage["latest_intervals"]), 3) == usage["latest_day_usage"]
+
+
+def test_usage_summary_sums_intervals_that_differ_per_row() -> None:
+    """Per-period interval arrays (older payloads) are still summed element-wise."""
+    usage = build_usage_summary(
+        {
+            "data": [
+                {
+                    "readDate": "2026-04-24",
+                    "usage": 1.0,
+                    "suffix": "E1",
+                    "chargeType": "Peak",
+                    "chargeCategoryCode": "USAGE",
+                    "usageArray": [1.0, 0.0],
+                },
+                {
+                    "readDate": "2026-04-24",
+                    "usage": 2.0,
+                    "suffix": "E1",
+                    "chargeType": "Offpeak",
+                    "chargeCategoryCode": "USAGE",
+                    "usageArray": [0.0, 2.0],
+                },
+            ]
+        }
+    )
+
+    assert usage["latest_intervals"] == [1.0, 2.0]
+
+
+def test_cost_usage_quantities_match_energy_registers_live_shape() -> None:
+    """The portal bills only the energy registers, confirming the #17 split."""
+    fixtures = load_zerohero_fixtures()
+    usage = build_usage_summary(fixtures["electricity_usage"])
+    cost = build_cost_summary(fixtures["electricity_cost"])
+    quantities = {row["chargeCategory"]: row["quantity"] for row in cost["categories"]}
+
+    # Cost quantities are rounded to 0.01 kWh per day, so allow 0.01 per day.
+    assert abs(quantities["USAGE"] - usage["total_usage"]) <= 0.03
+    assert abs(quantities["SOLAR"] - usage["total_export"]) <= 0.03
+    # Adding the tracking rows would overshoot the billed quantities.
+    assert usage["total_usage"] + 0.241 - quantities["USAGE"] > 0.2
+    assert cost["total_export_credit"] == 0.02
+    assert cost["latest_day_zerohero_credit"] == -1.0
+
+
+def test_usage_registers_expose_time_periods_daily_and_sensor_flag() -> None:
+    """Energy registers carry what per-register sensors and statistics need (#18)."""
+    usage = build_usage_summary(load_zerohero_fixtures()["electricity_usage"])
+    registers = _registers_by_key(usage)
+
+    offpeak = registers["E1-Offpeak Usage"]
+    assert offpeak["slug"] == "e1_offpeak_usage"
+    assert offpeak["time_periods"] == [{"start": "12:00", "end": "15:00"}]
+    assert offpeak["register_sensor"] is True
+    assert [row["readDate"] for row in offpeak["daily"]] == [
+        "2026/10/14",
+        "2026/10/15",
+        "2026/10/16",
+    ]
+    assert registers["E1-Shoulder Usage"]["time_periods"] == [
+        {"start": "00:00", "end": "12:00"},
+        {"start": "15:00", "end": "16:00"},
+        {"start": "23:00", "end": "24:00"},
+    ]
+    feed_in = registers["B1-Solar/Generation Feed in (4pm-11pm)"]
+    assert feed_in["slug"] == "b1_solar_generation_feed_in_4pm_11pm"
+    assert feed_in["register_sensor"] is True
+    assert sorted(
+        register["slug"]
+        for register in usage["registers"]
+        if register["register_sensor"]
+    ) == [
+        "b1_solar_generation_feed_in_11pm_4pm",
+        "b1_solar_generation_feed_in_4pm_11pm",
+        "e1_offpeak_usage",
+        "e1_peak_usage",
+        "e1_shoulder_usage",
+    ]
+
+
+def test_flat_rate_registers_get_no_register_sensor() -> None:
+    """A single register per class is already the class total: no extra sensor."""
+    usage = build_usage_summary(load_fixtures()["usage"])
+
+    assert usage["registers"]
+    assert not any(register["register_sensor"] for register in usage["registers"])
+
+
+def test_usage_classification_edge_cases() -> None:
+    """Category matching, missing categories and unknown categories (#17, #19)."""
+    rows = [
+        # Missing category: legacy rows keep counting.
+        {"readDate": "2026-05-01", "usage": 1.0, "suffix": "E1", "chargeType": "A"},
+        # Case and whitespace are ignored.
+        {
+            "readDate": "2026-05-01",
+            "usage": 2.0,
+            "suffix": "E1",
+            "chargeType": "B",
+            "chargeCategoryCode": " usage ",
+        },
+        # CLIMATE is an energy category the portal totals as import.
+        {
+            "readDate": "2026-05-01",
+            "usage": 0.5,
+            "suffix": "E1",
+            "chargeType": "C",
+            "chargeCategoryCode": "Climate",
+        },
+        # Unknown non-energy category: tracking only.
+        {
+            "readDate": "2026-05-01",
+            "usage": 9.0,
+            "suffix": "E1",
+            "chargeType": "Bonus",
+            "chargeCategoryCode": "SOME_NEW_REWARD",
+        },
+        # Unknown import register on another suffix stays general import.
+        {
+            "readDate": "2026-05-01",
+            "usage": 4.0,
+            "suffix": "E2",
+            "chargeType": "Usage",
+            "chargeCategoryCode": "USAGE",
+        },
+        "not-a-row",
+    ]
+
+    usage = build_usage_summary({"data": rows})
+    registers = _registers_by_key(usage)
+
+    assert usage["total_usage"] == 7.5
+    assert usage["total_controlled_load"] is None
+    assert registers["E1-Bonus"]["usage_class"] == "tracking"
+    assert registers["E1-Bonus"]["register_sensor"] is False
+    assert registers["E2-Usage"]["usage_class"] == "general_import"
+    assert registers["E2-Usage"]["register_sensor"] is True
+    assert registers["E1-A"]["time_periods"] == []
+
+
+def test_usage_summary_with_only_tracking_rows_keeps_registers() -> None:
+    """Totals are empty when no energy row exists, but the registers stay visible."""
+    usage = build_usage_summary(
+        {
+            "data": [
+                {
+                    "readDate": "2026-05-01",
+                    "usage": 1.5,
+                    "suffix": "E1",
+                    "chargeType": "ZeroHero",
+                    "chargeCategoryCode": "LOW_USAGE_REWARD_PER_DAY",
+                    "timePeriods": [
+                        {"startTime": "18:00:00", "endTime": "21:00:00"},
+                        {"startTime": "18:00:00", "endTime": "21:00:00"},
+                        {"startTime": None, "endTime": "bad"},
+                        "not-a-period",
+                    ],
+                }
+            ]
+        }
+    )
+
+    assert usage["days"] == 0
+    assert usage["total_usage"] is None
+    assert usage["daily"] == []
+    assert usage["total_export"] is None
+    assert [register["key"] for register in usage["registers"]] == ["E1-ZeroHero"]
+    assert usage["registers"][0]["time_periods"] == [
+        {"start": "18:00", "end": "21:00"},
+        {"start": None, "end": "bad"},
+    ]
+
+
+def test_controlled_load_registers_are_split_from_general_import() -> None:
+    """CONTROL rows get their own totals and per-register flags (#19)."""
+    rows = [
+        {
+            "readDate": day,
+            "usage": usage,
+            "suffix": suffix,
+            "chargeType": charge_type,
+            "chargeCategoryCode": category,
+        }
+        for day in ("2026-05-01", "2026-05-02")
+        for suffix, charge_type, category, usage in (
+            ("E1", "Peak Usage", "USAGE", 5.0),
+            ("E2", "Controlled Load 1", "CONTROL", 2.0),
+            ("E3", "Controlled Load 2", "control", 1.25),
+        )
+    ]
+
+    usage = build_usage_summary({"data": rows})
+    registers = _registers_by_key(usage)
+
+    assert usage["total_usage"] == 10.0
+    assert usage["total_controlled_load"] == 6.5
+    assert usage["latest_day_controlled_load"] == 3.25
+    assert [row["usage"] for row in usage["controlled_load_daily"]] == [3.25, 3.25]
+    assert registers["E1-Peak Usage"]["register_sensor"] is False
+    assert registers["E2-Controlled Load 1"]["register_sensor"] is True
+    assert registers["E3-Controlled Load 2"]["usage_class"] == "controlled_load"
+
+    attrs = usage_attributes(usage, direction="controlled_load")
+    assert attrs["daily_count"] == 2
+    assert [register["key"] for register in attrs["registers"]] == [
+        "E2-Controlled Load 1",
+        "E3-Controlled Load 2",
+    ]
+    assert attrs["registers"][0]["usage_class"] == "controlled_load"
+    import_attrs = usage_attributes(usage, direction="import")
+    assert [register["key"] for register in import_attrs["registers"]] == [
+        "E1-Peak Usage"
+    ]
+
+
+def test_register_slugs_stay_unique() -> None:
+    """Two portal keys that normalise to the same slug get distinct slugs."""
+    usage = build_usage_summary(
+        {
+            "data": [
+                {
+                    "readDate": "2026-05-01",
+                    "usage": 1.0,
+                    "suffix": "E1",
+                    "chargeType": "Peak-Usage",
+                    "chargeCategoryCode": "USAGE",
+                },
+                {
+                    "readDate": "2026-05-01",
+                    "usage": 1.0,
+                    "suffix": "E1",
+                    "chargeType": "Peak Usage",
+                    "chargeCategoryCode": "USAGE",
+                },
+                {"readDate": "2026-05-01", "usage": 1.0},
+            ]
+        }
+    )
+
+    assert sorted(register["slug"] for register in usage["registers"]) == [
+        "e1_peak_usage",
+        "e1_peak_usage_2",
+        "unknown",
     ]
 
 
@@ -1298,6 +1600,17 @@ def load_tests(
         test_cost_summary_net_daily_is_sum_not_last_row,
         test_cost_summary_ignores_supply_only_partial_latest_day,
         test_usage_summary_tracks_all_registers_and_b_exports,
+        test_usage_summary_keeps_solar_soak_import_register_out_of_export,
+        test_usage_summary_excludes_zerohero_reward_registers_live_shape,
+        test_usage_summary_latest_intervals_count_each_meter_channel_once,
+        test_usage_summary_sums_intervals_that_differ_per_row,
+        test_cost_usage_quantities_match_energy_registers_live_shape,
+        test_usage_registers_expose_time_periods_daily_and_sensor_flag,
+        test_flat_rate_registers_get_no_register_sensor,
+        test_usage_classification_edge_cases,
+        test_usage_summary_with_only_tracking_rows_keeps_registers,
+        test_controlled_load_registers_are_split_from_general_import,
+        test_register_slugs_stay_unique,
         test_cost_summary_exposes_new_category_totals,
         test_cost_summary_projects_current_month_cost,
         test_sensor_attributes_are_recorder_safe_summaries,

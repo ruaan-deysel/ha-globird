@@ -422,7 +422,7 @@ def test_gas_statistics_continue_across_meter_replacement() -> None:
     )
 
     assert [row["state"] for row in statistics] == [100.0, 110.0, 5.0, 12.0]
-    assert [row["sum"] for row in statistics] == [100.0, 110.0, 110.0, 117.0]
+    assert [row["sum"] for row in statistics] == [0.0, 10.0, 10.0, 17.0]
     assert statistics[0]["start"].utcoffset() == timedelta(hours=10)
 
 
@@ -437,7 +437,110 @@ def test_gas_statistics_ignore_downward_correction_without_double_counting() -> 
         tzinfo=UTC,
     )
 
-    assert [row["sum"] for row in statistics] == [100.0, 100.0, 102.0]
+    assert [row["sum"] for row in statistics] == [0.0, 0.0, 2.0]
+
+
+def test_gas_statistics_first_read_starts_sum_at_zero() -> None:
+    """The first meter index is a baseline, not consumption.
+
+    Home Assistant's recorder computes change for the first-ever statistics
+    row as ``sum - 0``, so a first sum equal to the meter index would show the
+    whole index as consumed in the Energy dashboard.
+    """
+    statistics = sensor._build_gas_statistics(
+        [
+            {"date": "2026-01-01", "read_index": 746.0, "serial": "meter"},
+            {"date": "2026-04-01", "read_index": 790.5, "serial": "meter"},
+        ],
+        tzinfo=UTC,
+    )
+
+    assert [row["state"] for row in statistics] == [746.0, 790.5]
+    assert [row["sum"] for row in statistics] == [0.0, 44.5]
+
+
+def test_gas_statistics_single_read_has_zero_sum() -> None:
+    """A single published read yields a zero sum with the index as state."""
+    statistics = sensor._build_gas_statistics(
+        [{"date": "2026-01-01", "read_index": 790.0, "serial": "meter"}],
+        tzinfo=UTC,
+    )
+
+    assert len(statistics) == 1
+    assert statistics[0]["state"] == 790.0
+    assert statistics[0]["sum"] == 0.0
+
+
+def test_gas_statistics_new_serial_first_read_is_baseline() -> None:
+    """A replacement meter's first read is its baseline and adds no usage."""
+    statistics = sensor._build_gas_statistics(
+        [
+            {"date": "2026-01-01", "read_index": 500.0, "serial": "old"},
+            {"date": "2026-02-01", "read_index": 520.0, "serial": "old"},
+            {"date": "2026-03-01", "read_index": 900.0, "serial": "new"},
+            {"date": "2026-04-01", "read_index": 930.0, "serial": "new"},
+        ],
+        tzinfo=UTC,
+    )
+
+    assert [row["sum"] for row in statistics] == [0.0, 20.0, 20.0, 50.0]
+
+
+def test_daily_cumulative_statistics_first_row_is_first_day_usage() -> None:
+    """Daily rows are per-day usage, so the first sum is that day's usage."""
+    statistics = sensor._build_daily_cumulative_statistics(
+        [
+            {"readDate": "2026-09-26", "usage": 3.5},
+            {"readDate": "2026-09-27", "usage": 4.25},
+        ],
+        date_key="readDate",
+        value_key="usage",
+        tzinfo=UTC,
+    )
+
+    assert [row["state"] for row in statistics] == [3.5, 4.25]
+    assert [row["sum"] for row in statistics] == [3.5, 7.75]
+
+
+def _gas_reading_entity(summary: dict[str, Any]) -> Any:
+    """Return a Latest Gas Reading entity backed by the given summary."""
+
+    class FakeCoordinator:
+        data = {
+            "service_data": {
+                "123": {
+                    "service": {"accountServiceId": 123, "serviceType": "Gas"},
+                    "gas_reading_summary": summary,
+                }
+            }
+        }
+
+    return sensor.GloBirdLatestGasReadingSensor(
+        FakeCoordinator(),
+        types.SimpleNamespace(entry_id="entry-1"),
+        {"accountServiceId": 123, "serviceType": "Gas"},
+    )
+
+
+def test_latest_gas_reading_is_unknown_without_reads() -> None:
+    """A gas service with no published reads must report unknown, not 0.0."""
+    assert _gas_reading_entity({}).native_value is None
+    assert _gas_reading_entity({"latest_reading": None}).native_value is None
+
+
+def test_latest_gas_reading_has_no_state_class() -> None:
+    """The meter index entity must not compile its own long-term statistics.
+
+    The imported ``globird:`` external statistic is the Energy dashboard
+    source; a recorder-compiled sum on a quarterly index books each read
+    jump into a single hour.
+    """
+    entity = _gas_reading_entity({"latest_reading": 790.0})
+
+    assert entity._attr_state_class is None
+    assert entity._attr_device_class == sensor.SensorDeviceClass.GAS
+    assert entity._attr_native_unit_of_measurement == sensor.UnitOfVolume.CUBIC_METERS
+    assert entity.native_value == 790.0
 
 
 def test_latest_gas_reading_sensor_exposes_reading_summary() -> None:

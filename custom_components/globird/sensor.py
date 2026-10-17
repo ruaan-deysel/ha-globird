@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from datetime import time as dt_time
@@ -32,6 +32,7 @@ from homeassistant.const import (
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_point_in_time
+from homeassistant.helpers.start import async_at_started
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 from homeassistant.util.unit_conversion import EnergyConverter, VolumeConverter
@@ -559,6 +560,21 @@ GLOBAL_SENSORS: tuple[GloBirdSensorDescription, ...] = (
 )
 
 
+def _create_background_upload(
+    entity: GloBirdBaseSensor,
+    upload: Coroutine[Any, Any, None],
+    kind: str,
+) -> None:
+    """Start a statistics upload that Home Assistant does not wait for.
+
+    The task belongs to the config entry, so unloading or reloading the
+    entry cancels it before a new entity can start its own upload.
+    """
+    entity._config_entry.async_create_background_task(
+        entity.hass, upload, f"globird {kind} upload {entity.entity_id}"
+    )
+
+
 def _register_unique_id(config_entry: ConfigEntry, sid: str, slug: str) -> str:
     """Return the unique ID of a per-register usage sensor."""
     return f"{config_entry.entry_id}_service_{sid}_register_{slug}"
@@ -1059,9 +1075,23 @@ class GloBirdDailyStatisticsSensor(GloBirdServiceBaseSensor):
         self._statistics_lock = asyncio.Lock()
 
     async def async_added_to_hass(self) -> None:
-        """Upload the daily series to recorder long-term statistics."""
+        """Upload the daily series once Home Assistant has started."""
         await super().async_added_to_hass()
-        await self._async_upload_statistics_serialised()
+        self.async_on_remove(
+            async_at_started(self.hass, self._async_start_statistics_upload)
+        )
+
+    @callback
+    def _async_start_statistics_upload(self, _hass: HomeAssistant) -> None:
+        """Run the first upload in the background.
+
+        The upload waits for recorder commits, and the recorder does not
+        commit until Home Assistant has started, so it must never run inside
+        entity setup.
+        """
+        _create_background_upload(
+            self, self._async_upload_statistics_serialised(), "daily statistics"
+        )
 
     def _handle_coordinator_update(self) -> None:
         """Refresh the entity and import newly published statistics."""
@@ -1212,16 +1242,40 @@ class GloBirdLatestGasReadingSensor(GloBirdServiceBaseSensor):
     # carries the cumulative sum and is the Energy dashboard gas source.
     sensor_state_class = None
 
+    def __init__(
+        self,
+        coordinator: GloBirdCoordinator,
+        config_entry: ConfigEntry,
+        service: dict[str, Any],
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, config_entry, service)
+        self._statistics_lock = asyncio.Lock()
+
     async def async_added_to_hass(self) -> None:
-        """Upload historical gas readings to recorder long-term statistics."""
+        """Upload historical gas readings once Home Assistant has started."""
         await super().async_added_to_hass()
-        await self._async_upload_historical_statistics()
+        self.async_on_remove(
+            async_at_started(self.hass, self._async_start_statistics_upload)
+        )
+
+    @callback
+    def _async_start_statistics_upload(self, _hass: HomeAssistant) -> None:
+        """Run the first gas history upload in the background."""
+        _create_background_upload(
+            self, self._async_upload_gas_statistics_serialised(), "gas statistics"
+        )
 
     def _handle_coordinator_update(self) -> None:
         """Refresh the entity and import any newly published gas reads."""
         super()._handle_coordinator_update()
         if hasattr(self.hass, "async_create_task"):
-            self.hass.async_create_task(self._async_upload_historical_statistics())
+            self.hass.async_create_task(self._async_upload_gas_statistics_serialised())
+
+    async def _async_upload_gas_statistics_serialised(self) -> None:
+        """Upload the gas history after any earlier upload has finished."""
+        async with self._statistics_lock:
+            await self._async_upload_historical_statistics()
 
     async def _async_upload_historical_statistics(self) -> None:
         """Import all historical gas meter reads as external statistics."""
@@ -1322,6 +1376,8 @@ class GloBirdLatestGasReadingSensor(GloBirdServiceBaseSensor):
                 statistic_id,
                 err,
             )
+            return
+        await self._async_wait_for_statistics_commit(statistic_id)
 
     @property
     def native_value(self) -> Any:

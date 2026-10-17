@@ -33,6 +33,7 @@ recorder_models = types.ModuleType("homeassistant.components.recorder.models")
 helpers = types.ModuleType("homeassistant.helpers")
 entity_platform = types.ModuleType("homeassistant.helpers.entity_platform")
 event = types.ModuleType("homeassistant.helpers.event")
+start = types.ModuleType("homeassistant.helpers.start")
 storage = types.ModuleType("homeassistant.helpers.storage")
 update_coordinator = types.ModuleType("homeassistant.helpers.update_coordinator")
 util = types.ModuleType("homeassistant.util")
@@ -77,6 +78,7 @@ class CoordinatorEntity:
     def __init__(self, coordinator: Any) -> None:
         self.coordinator = coordinator
         self.hass = object()
+        self.entity_id: str | None = None
         self._remove_callbacks: list[Any] = []
         self._write_count = 0
 
@@ -137,6 +139,12 @@ def async_track_point_in_time(*_args: Any, **_kwargs: Any) -> Any:
     return lambda: None
 
 
+def async_at_started(hass: Any, at_start_cb: Any) -> Any:
+    """Run the callback now, as Home Assistant does once it has started."""
+    at_start_cb(hass)
+    return lambda: None
+
+
 sensor_component.SensorDeviceClass = SensorDeviceClass
 sensor_component.SensorEntity = SensorEntity
 sensor_component.SensorStateClass = SensorStateClass
@@ -149,6 +157,7 @@ core.HomeAssistant = object
 core.callback = lambda func: func
 entity_platform.AddEntitiesCallback = object
 event.async_track_point_in_time = async_track_point_in_time
+start.async_at_started = async_at_started
 storage.Store = Store
 update_coordinator.CoordinatorEntity = CoordinatorEntity
 update_coordinator.DataUpdateCoordinator = DataUpdateCoordinator
@@ -168,6 +177,7 @@ components.sensor = sensor_component
 components.recorder = recorder
 helpers.entity_platform = entity_platform
 helpers.event = event
+helpers.start = start
 helpers.storage = storage
 helpers.update_coordinator = update_coordinator
 homeassistant.components = components
@@ -188,6 +198,7 @@ sys.modules["homeassistant.core"] = core
 sys.modules["homeassistant.helpers"] = helpers
 sys.modules["homeassistant.helpers.entity_platform"] = entity_platform
 sys.modules["homeassistant.helpers.event"] = event
+sys.modules["homeassistant.helpers.start"] = start
 sys.modules["homeassistant.helpers.storage"] = storage
 sys.modules["homeassistant.helpers.update_coordinator"] = update_coordinator
 sys.modules["homeassistant.util"] = util
@@ -209,9 +220,13 @@ class FakeEntry:
         self.entry_id = entry_id
         self.runtime_data = runtime_data
         self.unload_callbacks: list[Any] = []
+        self.background_tasks: list[tuple[Any, str]] = []
 
     def async_on_unload(self, func: Any) -> None:
         self.unload_callbacks.append(func)
+
+    def async_create_background_task(self, _hass: Any, target: Any, name: str) -> None:
+        self.background_tasks.append((target, name))
 
 
 class ListenerMixin:
@@ -1329,6 +1344,9 @@ def test_energy_dashboard_sensors_and_external_statistics(monkeypatch: Any) -> N
         if hasattr(ent, "last_reset"):
             _ = ent.last_reset
         asyncio.run(ent.async_added_to_hass())
+        for upload, _name in entry.background_tasks:
+            asyncio.run(upload)
+        entry.background_tasks.clear()
         ent._handle_coordinator_update()
 
     assert len(uploaded) >= 4
@@ -1802,16 +1820,18 @@ def test_daily_statistics_uploads_run_one_at_a_time() -> None:
             await asyncio.sleep(0)
             events.append("end")
 
-    entity = Sensor(_UsageCoordinator({}), FakeEntry(), _POWER_SERVICE)
+    entry = FakeEntry()
+    entity = Sensor(_UsageCoordinator({}), entry, _POWER_SERVICE)
 
     async def run_two() -> None:
         tasks: list[Any] = []
         entity.hass = types.SimpleNamespace(
             async_create_task=lambda coro: tasks.append(asyncio.ensure_future(coro))
         )
-        added = asyncio.ensure_future(entity.async_added_to_hass())
+        await entity.async_added_to_hass()
+        tasks.extend(asyncio.ensure_future(coro) for coro, _ in entry.background_tasks)
         entity._handle_coordinator_update()
-        await asyncio.gather(added, *tasks)
+        await asyncio.gather(*tasks)
 
     asyncio.run(run_two())
 
@@ -1949,3 +1969,136 @@ def test_daily_upload_accepts_synchronous_recorder_api(monkeypatch: Any) -> None
     asyncio.run(_usage_total_entity(_DAILY)._async_upload_statistics())
 
     assert [row["sum"] for row in calls[0][1]] == [2.0, 5.0]
+
+
+def _deferred_start(monkeypatch: Any) -> list[Any]:
+    """Hold ``async_at_started`` callbacks until the test releases them."""
+    started: list[Any] = []
+
+    def at_started(hass: Any, at_start_cb: Any) -> Any:
+        started.append(lambda: at_start_cb(hass))
+        return lambda: None
+
+    monkeypatch.setattr(sensor, "async_at_started", at_started)
+    return started
+
+
+def test_daily_statistics_upload_waits_for_started_not_setup(
+    monkeypatch: Any,
+) -> None:
+    """Entity setup never runs the upload; it starts in the background later."""
+    started = _deferred_start(monkeypatch)
+    events: list[str] = []
+
+    class Sensor(sensor.GloBirdDailyStatisticsSensor):
+        async def _async_upload_statistics(self) -> None:
+            events.append("upload")
+
+    entry = FakeEntry()
+    background = entry.background_tasks
+    entity = Sensor(_UsageCoordinator({}), entry, _POWER_SERVICE)
+    entity.entity_id = "sensor.globird_usage"
+    entity.hass = types.SimpleNamespace()
+
+    asyncio.run(entity.async_added_to_hass())
+    assert events == []
+    assert background == []
+    assert len(started) == 1
+    assert len(entity._remove_callbacks) == 1
+
+    started[0]()
+    assert len(background) == 1
+    upload, name = background[0]
+    assert name == "globird daily statistics upload sensor.globird_usage"
+    asyncio.run(upload)
+    assert events == ["upload"]
+
+
+def test_gas_statistics_upload_waits_for_started_not_setup(
+    monkeypatch: Any,
+) -> None:
+    """The gas history upload also starts in the background once started."""
+    started = _deferred_start(monkeypatch)
+    events: list[str] = []
+    entry = FakeEntry()
+    background = entry.background_tasks
+
+    async def upload(_self: Any) -> None:
+        events.append("upload")
+
+    monkeypatch.setattr(
+        sensor.GloBirdLatestGasReadingSensor,
+        "_async_upload_historical_statistics",
+        upload,
+    )
+    entity = sensor.GloBirdLatestGasReadingSensor(
+        _UsageCoordinator({}),
+        entry,
+        {"accountServiceId": 123, "serviceType": "Gas"},
+    )
+    entity.entity_id = "sensor.globird_gas"
+    entity.hass = types.SimpleNamespace()
+
+    asyncio.run(entity.async_added_to_hass())
+    assert events == []
+    assert background == []
+
+    started[0]()
+    upload_coro, name = background[0]
+    assert name == "globird gas statistics upload sensor.globird_gas"
+    asyncio.run(upload_coro)
+    assert events == ["upload"]
+
+
+def test_gas_statistics_uploads_run_one_at_a_time(monkeypatch: Any) -> None:
+    """The startup gas upload and a refresh upload never interleave."""
+    events: list[str] = []
+
+    async def upload(_self: Any) -> None:
+        events.append("start")
+        await asyncio.sleep(0)
+        events.append("end")
+
+    monkeypatch.setattr(
+        sensor.GloBirdLatestGasReadingSensor,
+        "_async_upload_historical_statistics",
+        upload,
+    )
+    entry = FakeEntry()
+    entity = sensor.GloBirdLatestGasReadingSensor(
+        _UsageCoordinator({}),
+        entry,
+        {"accountServiceId": 123, "serviceType": "Gas"},
+    )
+
+    async def run_two() -> None:
+        tasks: list[Any] = []
+        entity.hass = types.SimpleNamespace(
+            async_create_task=lambda coro: tasks.append(asyncio.ensure_future(coro))
+        )
+        await entity.async_added_to_hass()
+        tasks.extend(asyncio.ensure_future(coro) for coro, _ in entry.background_tasks)
+        entity._handle_coordinator_update()
+        await asyncio.gather(*tasks)
+
+    asyncio.run(run_two())
+
+    assert events == ["start", "end", "start", "end"]
+
+
+def test_gas_upload_waits_for_recorder_commit(monkeypatch: Any) -> None:
+    """A successful gas import waits for the recorder commit."""
+    uploaded, _queries = _install_recorder_stubs(monkeypatch, [])
+    waited: list[str] = []
+
+    async def wait(_self: Any, statistic_id: str) -> None:
+        waited.append(statistic_id)
+
+    monkeypatch.setattr(
+        sensor.GloBirdServiceBaseSensor, "_async_wait_for_statistics_commit", wait
+    )
+    entity = _gas_reading_entity(_GAS_HISTORY)
+    asyncio.run(entity._async_upload_historical_statistics())
+
+    assert len(uploaded) == 1
+    assert waited == [uploaded[0][0]["statistic_id"]]

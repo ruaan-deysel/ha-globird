@@ -57,6 +57,8 @@ ZEROHERO_STATUS_OPTIONS: list[str] = [
     "unknown",
 ]
 ZEROHERO_RESULT_CUTOFF = dt_time(hour=21)
+# Earliest time searched for stored gas statistics rows.
+GAS_STATISTICS_EPOCH = datetime(2000, 1, 1, tzinfo=UTC)
 
 
 def _latest_data_status(detail: dict[str, Any]) -> dict[str, Any]:
@@ -272,6 +274,7 @@ def _build_gas_statistics(
     history_rows: list[dict[str, Any]],
     *,
     tzinfo: Any,
+    stored_before: tuple[float, float] | None = None,
 ) -> list[StatisticData]:
     """Build serial-aware cumulative gas statistics.
 
@@ -280,6 +283,14 @@ def _build_gas_statistics(
     Assistant's recorder treats the first-ever row's ``sum`` as consumption
     (change is computed against 0), so starting at the meter index would show
     the whole index as used on the first read day.
+
+    The portal only returns reads from a rolling window, so older reads drop
+    out of ``history_rows`` while their rows stay in the recorder.
+    ``stored_before`` is the ``(state, sum)`` of the last stored row before the
+    first row here. When given, the sum continues from it instead of
+    restarting at 0.0, so a rewritten first row never drops below the stored
+    row before it. The stored row has no serial, so the first row here is
+    treated as the same meter: a lower index adds no usage.
 
     A replacement meter may restart at a lower index. Keep an independent
     high-water mark for each serial so the cumulative sum continues without
@@ -317,6 +328,9 @@ def _build_gas_statistics(
 
         if cumulative_sum is None:
             cumulative_sum = 0.0
+            if stored_before is not None:
+                stored_state, stored_sum = stored_before
+                cumulative_sum = stored_sum + max(0.0, reading - stored_state)
         elif previous is not None and reading > previous:
             cumulative_sum += reading - previous
 
@@ -974,10 +988,8 @@ class GloBirdLatestGasReadingSensor(GloBirdServiceBaseSensor):
         except ImportError:
             return
 
-        statistics = _build_gas_statistics(
-            history_rows,
-            tzinfo=dt_util.now().tzinfo or UTC,
-        )
+        tzinfo = dt_util.now().tzinfo or UTC
+        statistics = _build_gas_statistics(history_rows, tzinfo=tzinfo)
 
         if not statistics:
             _LOGGER.debug(
@@ -992,6 +1004,24 @@ class GloBirdLatestGasReadingSensor(GloBirdServiceBaseSensor):
             self._service_id,
         )
         statistic_id = f"{DOMAIN}:{statistic_suffix}"
+        try:
+            stored_before = await self._async_stored_row_before(
+                statistic_id, statistics[0]["start"]
+            )
+        except Exception as err:
+            # Never rewrite stored rows without knowing where the sum must
+            # continue from; retry on the next coordinator update.
+            _LOGGER.warning(
+                "GloBird gas statistics import skipped for %s (%s): could not read stored statistics: %s",
+                self._service_id,
+                statistic_id,
+                err,
+            )
+            return
+        if stored_before is not None:
+            statistics = _build_gas_statistics(
+                history_rows, tzinfo=tzinfo, stored_before=stored_before
+            )
         metadata = StatisticMetaData(
             has_mean=False,
             mean_type=StatisticMeanType.NONE,
@@ -1023,6 +1053,39 @@ class GloBirdLatestGasReadingSensor(GloBirdServiceBaseSensor):
                 statistic_id,
                 err,
             )
+
+    async def _async_stored_row_before(
+        self, statistic_id: str, before: datetime
+    ) -> tuple[float, float] | None:
+        """Return ``(state, sum)`` of the last stored gas row before ``before``.
+
+        Rows older than the portal's read window are no longer imported, so
+        the new rows must continue from the last of them.
+        """
+        from homeassistant.components.recorder.statistics import (
+            statistics_during_period,
+        )
+        from homeassistant.helpers.recorder import get_instance
+
+        stored = await get_instance(self.hass).async_add_executor_job(
+            statistics_during_period,
+            self.hass,
+            GAS_STATISTICS_EPOCH,
+            before,
+            {statistic_id},
+            "hour",
+            None,
+            {"state", "sum"},
+        )
+        rows = stored.get(statistic_id) or []
+        if not rows:
+            return None
+        last = rows[-1]
+        state = last.get("state")
+        total = last.get("sum")
+        if state is None or total is None:
+            return None
+        return float(state), float(total)
 
     @property
     def native_value(self) -> Any:

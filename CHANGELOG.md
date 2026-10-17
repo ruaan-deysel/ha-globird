@@ -21,6 +21,11 @@ This project uses Home Assistant's calendar versioning scheme (`YYYY.M.P`, for e
 
 ### Fixed
 
+- Gas meter index no longer shows up as gas usage in the Energy dashboard ([#16](https://github.com/tinkerologie/ha-globird/issues/16)):
+  - The imported gas statistic `globird:<entry>_service_<id>_latest_gas_reading` now starts its sum at 0 at the first meter read. Before, the sum started at the meter index, and Home Assistant counted that whole index as gas used on the first read day. Existing statistics are corrected on the next refresh, because every published read is imported again.
+  - *Latest Gas Reading* is now `unknown` until the first meter read is published, instead of `0.0`.
+  - *Latest Gas Reading* no longer has a state class (it was `total_increasing`), so Home Assistant no longer records its own long-term statistics for it. A basic gas meter is read about every three months, and those statistics put each read's full jump into a single hour. **Action needed:** if your Energy dashboard uses the `sensor.…_latest_gas_reading_<mirn>` entity as the gas source, replace it with the `globird:…_latest_gas_reading` statistic (shown as *Latest Gas Reading (<mirn>)*). Home Assistant may then offer to fix the entity's old statistics under **Developer tools > Statistics**.
+
 ## [2026.10.2] - 2026-09-28
 
 ### Fixed

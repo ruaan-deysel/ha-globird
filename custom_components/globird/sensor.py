@@ -272,12 +272,19 @@ def _build_gas_statistics(
     history_rows: list[dict[str, Any]],
     *,
     tzinfo: Any,
-) -> list[dict[str, Any]]:
+) -> list[StatisticData]:
     """Build serial-aware cumulative gas statistics.
+
+    ``state`` is the meter read index; ``sum`` is the gas used since the first
+    read. The first read is a baseline, so ``sum`` starts at 0.0: Home
+    Assistant's recorder treats the first-ever row's ``sum`` as consumption
+    (change is computed against 0), so starting at the meter index would show
+    the whole index as used on the first read day.
 
     A replacement meter may restart at a lower index. Keep an independent
     high-water mark for each serial so the cumulative sum continues without
-    discarding usage from the replacement meter.
+    discarding usage from the replacement meter. A serial's first read is its
+    baseline and adds no usage.
     """
     rows = sorted(
         (
@@ -298,7 +305,7 @@ def _build_gas_statistics(
 
     meter_high_water: dict[str, float] = {}
     cumulative_sum: float | None = None
-    by_day: dict[date, dict[str, Any]] = {}
+    by_day: dict[date, StatisticData] = {}
 
     for row in rows:
         parsed_day = _parse_portal_day(row.get("date"))
@@ -309,18 +316,18 @@ def _build_gas_statistics(
         previous = meter_high_water.get(meter_key)
 
         if cumulative_sum is None:
-            cumulative_sum = reading
+            cumulative_sum = 0.0
         elif previous is not None and reading > previous:
             cumulative_sum += reading - previous
 
         meter_high_water[meter_key] = (
             reading if previous is None else max(previous, reading)
         )
-        by_day[parsed_day] = {
-            "start": datetime.combine(parsed_day, dt_time.min, tzinfo=tzinfo),
-            "state": reading,
-            "sum": cumulative_sum,
-        }
+        by_day[parsed_day] = StatisticData(
+            start=datetime.combine(parsed_day, dt_time.min, tzinfo=tzinfo),
+            state=reading,
+            sum=cumulative_sum,
+        )
 
     return [by_day[day] for day in sorted(by_day)]
 
@@ -331,7 +338,7 @@ def _build_daily_cumulative_statistics(
     date_key: str,
     value_key: str,
     tzinfo: Any,
-) -> list[dict[str, Any]]:
+) -> list[StatisticData]:
     """Build cumulative daily statistics for Energy Dashboard consumption or cost."""
     by_day: dict[date, float] = {}
     for row in daily_rows:
@@ -347,16 +354,16 @@ def _build_daily_cumulative_statistics(
         return []
 
     cumulative_sum = 0.0
-    result: list[dict[str, Any]] = []
+    result: list[StatisticData] = []
     for day in sorted(by_day):
         day_value = round(by_day[day], 3)
         cumulative_sum = round(cumulative_sum + day_value, 3)
         result.append(
-            {
-                "start": datetime.combine(day, dt_time.min, tzinfo=tzinfo),
-                "state": day_value,
-                "sum": cumulative_sum,
-            }
+            StatisticData(
+                start=datetime.combine(day, dt_time.min, tzinfo=tzinfo),
+                state=day_value,
+                sum=cumulative_sum,
+            )
         )
     return result
 
@@ -765,15 +772,12 @@ class GloBirdServiceBaseSensor(GloBirdBaseSensor):
         except ImportError:
             return
 
-        statistics = [
-            StatisticData(**row)
-            for row in _build_daily_cumulative_statistics(
-                daily_rows,
-                date_key=date_key,
-                value_key=value_key,
-                tzinfo=dt_util.now().tzinfo or UTC,
-            )
-        ]
+        statistics = _build_daily_cumulative_statistics(
+            daily_rows,
+            date_key=date_key,
+            value_key=value_key,
+            tzinfo=dt_util.now().tzinfo or UTC,
+        )
         if not statistics:
             return
 
@@ -935,7 +939,10 @@ class GloBirdLatestGasReadingSensor(GloBirdServiceBaseSensor):
     sensor_icon = "mdi:meter-gas"
     sensor_unit = UnitOfVolume.CUBIC_METERS
     sensor_device_class = SensorDeviceClass.GAS
-    sensor_state_class = SensorStateClass.TOTAL_INCREASING
+    # No state class: a meter index read every few months cannot produce
+    # correct hourly statistics. The imported ``globird:`` external statistic
+    # carries the cumulative sum and is the Energy dashboard gas source.
+    sensor_state_class = None
 
     async def async_added_to_hass(self) -> None:
         """Upload historical gas readings to recorder long-term statistics."""
@@ -967,13 +974,10 @@ class GloBirdLatestGasReadingSensor(GloBirdServiceBaseSensor):
         except ImportError:
             return
 
-        statistics = [
-            StatisticData(**row)
-            for row in _build_gas_statistics(
-                history_rows,
-                tzinfo=dt_util.now().tzinfo or UTC,
-            )
-        ]
+        statistics = _build_gas_statistics(
+            history_rows,
+            tzinfo=dt_util.now().tzinfo or UTC,
+        )
 
         if not statistics:
             _LOGGER.debug(
@@ -1022,10 +1026,9 @@ class GloBirdLatestGasReadingSensor(GloBirdServiceBaseSensor):
 
     @property
     def native_value(self) -> Any:
-        """Return latest gas meter read index."""
-        detail = self._service_detail()
-        val = (detail.get("gas_reading_summary") or {}).get("latest_reading")
-        return val if val is not None else (0.0 if detail else None)
+        """Return latest gas meter read index, or None until the first read."""
+        summary = self._service_detail().get("gas_reading_summary") or {}
+        return summary.get("latest_reading")
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:

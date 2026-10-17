@@ -644,6 +644,57 @@ def test_gas_upload_continues_from_stored_row(monkeypatch: Any) -> None:
     assert [row["sum"] for row in uploaded[0][1]] == [146.0, 190.0]
 
 
+def test_rebase_legacy_gas_rows_removes_initial_index() -> None:
+    """Rows stored with the old index-based sum are rebased to start at 0."""
+    start = datetime(2025, 10, 1, tzinfo=UTC)
+    rebased = sensor._rebase_legacy_gas_rows(
+        [
+            {"start": start, "state": 700.0, "sum": 700.0},
+            {"start": start + timedelta(days=60), "state": 730.0, "sum": 730.0},
+        ]
+    )
+
+    assert [row["start"] for row in rebased] == [start, start + timedelta(days=60)]
+    assert [row["state"] for row in rebased] == [700.0, 730.0]
+    assert [row["sum"] for row in rebased] == [0.0, 30.0]
+
+
+def test_rebase_legacy_gas_rows_leaves_current_rows_alone() -> None:
+    """Rows without a legacy offset, or no rows, need no rebase."""
+    start = datetime(2025, 10, 1, tzinfo=UTC)
+    assert sensor._rebase_legacy_gas_rows([]) == []
+    assert (
+        sensor._rebase_legacy_gas_rows([{"start": start, "state": 700.0, "sum": 0.0}])
+        == []
+    )
+    assert (
+        sensor._rebase_legacy_gas_rows([{"start": start, "state": 0.0, "sum": 0.0}])
+        == []
+    )
+
+
+def test_gas_upload_rebases_legacy_rows_outside_window(monkeypatch: Any) -> None:
+    """Legacy rows outside the window are rewritten once without the index."""
+    first = datetime(2025, 10, 1, tzinfo=UTC)
+    second = datetime(2025, 12, 1, tzinfo=UTC)
+    uploaded, _queries = _install_gas_recorder_stubs(
+        monkeypatch,
+        [
+            {"start": first.timestamp(), "state": 700.0, "sum": 700.0},
+            {"start": second.timestamp(), "state": 730.0, "sum": 730.0},
+        ],
+    )
+    entity = _gas_reading_entity(_GAS_HISTORY)
+
+    asyncio.run(entity._async_upload_historical_statistics())
+
+    rows = uploaded[0][1]
+    assert rows[0]["start"] == first
+    assert rows[1]["start"] == second
+    assert [row["state"] for row in rows] == [700.0, 730.0, 746.0, 790.0]
+    assert [row["sum"] for row in rows] == [0.0, 30.0, 46.0, 90.0]
+
+
 def test_gas_upload_ignores_stored_row_without_sum(monkeypatch: Any) -> None:
     """A stored row without state or sum cannot anchor the import."""
     uploaded, _queries = _install_gas_recorder_stubs(

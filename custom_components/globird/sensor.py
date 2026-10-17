@@ -346,6 +346,30 @@ def _build_gas_statistics(
     return [by_day[day] for day in sorted(by_day)]
 
 
+def _rebase_legacy_gas_rows(stored_rows: list[StatisticData]) -> list[StatisticData]:
+    """Return stored gas rows with a legacy meter-index offset removed.
+
+    Releases up to 2026.10.2 started the gas sum at the first meter index, so
+    the oldest stored row has ``sum == state``. Rows the portal no longer
+    returns are not imported again, so subtract that index from every stored
+    row once. Returns an empty list when the rows have no legacy offset; after
+    the rebase the oldest row's sum is 0, so this runs only once.
+    """
+    if not stored_rows:
+        return []
+    offset = stored_rows[0].get("sum")
+    if not offset or offset != stored_rows[0].get("state"):
+        return []
+    return [
+        StatisticData(
+            start=row["start"],
+            state=row.get("state") or 0.0,
+            sum=(row.get("sum") or 0.0) - offset,
+        )
+        for row in stored_rows
+    ]
+
+
 def _build_daily_cumulative_statistics(
     daily_rows: list[dict[str, Any]],
     *,
@@ -1005,7 +1029,7 @@ class GloBirdLatestGasReadingSensor(GloBirdServiceBaseSensor):
         )
         statistic_id = f"{DOMAIN}:{statistic_suffix}"
         try:
-            stored_before = await self._async_stored_row_before(
+            stored_rows = await self._async_stored_rows_before(
                 statistic_id, statistics[0]["start"]
             )
         except Exception as err:
@@ -1018,10 +1042,24 @@ class GloBirdLatestGasReadingSensor(GloBirdServiceBaseSensor):
                 err,
             )
             return
-        if stored_before is not None:
-            statistics = _build_gas_statistics(
-                history_rows, tzinfo=tzinfo, stored_before=stored_before
+        rebased_rows = _rebase_legacy_gas_rows(stored_rows)
+        if rebased_rows:
+            _LOGGER.info(
+                "GloBird gas statistics for %s (%s): removing the meter index "
+                "from %d stored rows imported before the sum started at 0",
+                self._service_id,
+                statistic_id,
+                len(rebased_rows),
             )
+            stored_rows = rebased_rows
+        if stored_rows:
+            last = stored_rows[-1]
+            statistics = _build_gas_statistics(
+                history_rows,
+                tzinfo=tzinfo,
+                stored_before=(last["state"], last["sum"]),
+            )
+        statistics = rebased_rows + statistics
         metadata = StatisticMetaData(
             has_mean=False,
             mean_type=StatisticMeanType.NONE,
@@ -1054,13 +1092,14 @@ class GloBirdLatestGasReadingSensor(GloBirdServiceBaseSensor):
                 err,
             )
 
-    async def _async_stored_row_before(
+    async def _async_stored_rows_before(
         self, statistic_id: str, before: datetime
-    ) -> tuple[float, float] | None:
-        """Return ``(state, sum)`` of the last stored gas row before ``before``.
+    ) -> list[StatisticData]:
+        """Return the stored gas rows that start before ``before``.
 
         Rows older than the portal's read window are no longer imported, so
-        the new rows must continue from the last of them.
+        the new rows must continue from the last of them. Rows without a
+        state or sum are left out.
         """
         from homeassistant.components.recorder.statistics import (
             statistics_during_period,
@@ -1077,15 +1116,20 @@ class GloBirdLatestGasReadingSensor(GloBirdServiceBaseSensor):
             None,
             {"state", "sum"},
         )
-        rows = stored.get(statistic_id) or []
-        if not rows:
-            return None
-        last = rows[-1]
-        state = last.get("state")
-        total = last.get("sum")
-        if state is None or total is None:
-            return None
-        return float(state), float(total)
+        rows: list[StatisticData] = []
+        for row in stored.get(statistic_id) or []:
+            state = row.get("state")
+            total = row.get("sum")
+            if state is None or total is None:
+                continue
+            rows.append(
+                StatisticData(
+                    start=datetime.fromtimestamp(float(row["start"]), UTC),
+                    state=float(state),
+                    sum=float(total),
+                )
+            )
+        return rows
 
     @property
     def native_value(self) -> Any:

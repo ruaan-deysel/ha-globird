@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import base64
 import calendar
+import hashlib
 import html
 import json
 import logging
+import re
 from datetime import UTC, date, datetime, time, timedelta
 from http.cookies import SimpleCookie
 from typing import Any
@@ -23,6 +25,7 @@ from .models import (
     CostSummary,
     GasReadingSummary,
     LatestDataStatus,
+    UsageClass,
     UsageSummary,
     WeatherSummary,
 )
@@ -30,6 +33,29 @@ from .models import (
 _LOGGER = logging.getLogger(__name__)
 
 ATTR_RECENT_ROW_LIMIT = 7
+
+# Usage row classes. Every usage row belongs to exactly one class; totals,
+# Energy statistics and per-register sensors all read this classification.
+USAGE_CLASS_GENERAL_IMPORT: UsageClass = "general_import"
+USAGE_CLASS_CONTROLLED_LOAD: UsageClass = "controlled_load"
+USAGE_CLASS_EXPORT: UsageClass = "export"
+USAGE_CLASS_TRACKING: UsageClass = "tracking"
+
+# Energy categories, from GloBird's own customer portal: its usage chart
+# totals only rows whose ``chargeCategoryCode`` is one of these (portal enum
+# USAGE / CONTROL / CLIMATE / SOLAR). Every other code, such as ZEROHERO's
+# ``LOW_USAGE_REWARD_PER_DAY`` (18:00-21:00) or Super Export's
+# ``ADDON_FEED_IN`` (18:00-21:00), re-reports part of an energy register's
+# window for a plan reward or add-on. Counting those rows again would
+# double-count energy, so they are "tracking" rows: listed per register but
+# never added to a total. An allow-list keeps future reward rows out of the
+# totals by default.
+ENERGY_CATEGORY_CODES = frozenset({"USAGE", "CONTROL", "CLIMATE", "SOLAR"})
+# ``CONTROL`` is the portal's controlled-load category. No controlled-load
+# account has been seen yet, so only this exact code is treated as
+# controlled load; any other import register (for example an ``E2`` row with
+# ``USAGE``) stays general import and is exposed per register.
+CONTROLLED_LOAD_CATEGORY_CODES = frozenset({"CONTROL"})
 
 
 class GloBirdApiError(Exception):
@@ -149,6 +175,7 @@ def _compact_usage_register(register: dict[str, Any]) -> dict[str, Any]:
         "chargeType": register.get("chargeType"),
         "chargeCategoryCode": register.get("chargeCategoryCode"),
         "direction": register.get("direction"),
+        "usage_class": register.get("usage_class"),
         "days": register.get("days"),
         "total": register.get("total"),
         "latest_day": register.get("latest_day"),
@@ -165,20 +192,41 @@ def _usage_latest_day(summary: dict[str, Any], daily: list[Any]) -> Any:
     return summary.get("latest_day")
 
 
+_USAGE_DAILY_KEYS = {
+    "import": "daily",
+    "export": "export_daily",
+    "controlled_load": "controlled_load_daily",
+}
+
+
+def _register_matches(register: dict[str, Any], direction: str) -> bool:
+    """Return whether a register belongs to a usage sensor's direction."""
+    is_controlled = register.get("usage_class") == USAGE_CLASS_CONTROLLED_LOAD
+    if direction == "controlled_load":
+        return is_controlled
+    return register.get("direction") == direction and not is_controlled
+
+
 def usage_attributes(
     summary: dict[str, Any],
     *,
     direction: str,
     include_latest_intervals: bool = False,
 ) -> dict[str, Any]:
-    """Return recorder-safe usage attributes for import or export sensors."""
-    daily_key = "export_daily" if direction == "export" else "daily"
+    """Return recorder-safe usage attributes for import, export or controlled load.
+
+    ``direction`` is ``import``, ``export`` or ``controlled_load``. Import and
+    export list every register in that direction, including tracking rows;
+    controlled load lists only controlled-load registers, which import no
+    longer lists.
+    """
+    daily_key = _USAGE_DAILY_KEYS.get(direction, "daily")
     daily = summary.get(daily_key, [])
     daily_rows = daily if isinstance(daily, list) else []
     registers = [
         _compact_usage_register(register)
         for register in summary.get("registers", [])
-        if isinstance(register, dict) and register.get("direction") == direction
+        if isinstance(register, dict) and _register_matches(register, direction)
     ]
 
     attrs: dict[str, Any] = {
@@ -435,6 +483,10 @@ def _build_register_summary(
     Each day has multiple rows (one per time-of-use period). Group by date
     so that daily totals and latest_day_usage are correct sums, not a single
     time-of-use period's value.
+
+    The portal repeats the meter channel's full-day ``usageArray`` on every
+    row of that channel (suffix), so identical arrays for the same day and
+    suffix are summed once. Arrays that differ are summed element-wise.
     """
     if not rows:
         return {
@@ -458,20 +510,26 @@ def _build_register_summary(
                 "meterStatus": row.get("meterStatus"),
                 "minQualityMethod": row.get("minQualityMethod"),
                 "intervals": None,
+                "arrays": {},
             }
         by_date[d]["usage"] += usage
-        # Element-wise sum of usageArrays across all time-of-use periods for the day
+        # Element-wise sum of the day's distinct usageArrays per meter channel
         arr = row.get("usageArray")
-        if isinstance(arr, list) and arr:
-            existing = by_date[d]["intervals"]
-            if existing is None:
-                by_date[d]["intervals"] = list(arr)
-            else:
-                for i, v in enumerate(arr):
-                    if i < len(existing):
-                        existing[i] = (_as_float(existing[i]) or 0.0) + (
-                            _as_float(v) or 0.0
-                        )
+        if not isinstance(arr, list) or not arr:
+            continue
+        channel = str(row.get("suffix") or "").strip().upper()
+        seen = by_date[d]["arrays"].setdefault(channel, [])
+        if arr in seen:
+            continue
+        seen.append(arr)
+        existing = by_date[d]["intervals"]
+        if existing is None:
+            by_date[d]["intervals"] = list(arr)
+        else:
+            # Channels can report different lengths; keep every interval.
+            existing.extend([0.0] * (len(arr) - len(existing)))
+            for i, v in enumerate(arr):
+                existing[i] = (_as_float(existing[i]) or 0.0) + (_as_float(v) or 0.0)
 
     total = sum(v["usage"] for v in by_date.values())
     latest_date = max(by_date) if by_date else None
@@ -533,28 +591,125 @@ def _is_export_register(row: dict[str, Any]) -> bool:
     )
 
 
+def _usage_category_code(row: dict[str, Any]) -> str:
+    """Return the normalised ``chargeCategoryCode`` of a usage row."""
+    return str(row.get("chargeCategoryCode") or "").strip().upper()
+
+
+def classify_usage_row(row: dict[str, Any]) -> UsageClass:
+    """Return the usage class of a portal usage row.
+
+    Rows with a category outside ``ENERGY_CATEGORY_CODES`` are tracking rows
+    (rewards and add-ons). Rows without a category keep counting as energy,
+    as before. Direction comes from ``_is_export_register``; import energy is
+    controlled load only for ``CONTROLLED_LOAD_CATEGORY_CODES``.
+    """
+    category = _usage_category_code(row)
+    if category and category not in ENERGY_CATEGORY_CODES:
+        return USAGE_CLASS_TRACKING
+    if _is_export_register(row):
+        return USAGE_CLASS_EXPORT
+    if category in CONTROLLED_LOAD_CATEGORY_CODES:
+        return USAGE_CLASS_CONTROLLED_LOAD
+    return USAGE_CLASS_GENERAL_IMPORT
+
+
+def _usage_register_slug(key: str) -> str:
+    """Return a lower-case, entity-ID-safe slug for a register key."""
+    return re.sub(r"[^a-z0-9]+", "_", key.lower()).strip("_") or "unknown"
+
+
+_TIME_OF_DAY_PATTERN = re.compile(r"(?:(\d+)\.)?(\d{1,2}):(\d{2})(?::\d{2}(?:\.\d+)?)?")
+
+
+def _time_of_day(value: Any) -> str | None:
+    """Return ``HH:MM`` for a portal time of day.
+
+    The portal sends .NET TimeSpan strings, so the end of the day is
+    ``1.00:00:00``; that becomes ``24:00``. Unrecognised values are returned
+    unchanged.
+    """
+    if value is None:
+        return None
+    raw = str(value).strip()
+    match = _TIME_OF_DAY_PATTERN.fullmatch(raw)
+    if match is None:
+        return raw or None
+    days, hours, minutes = match.groups()
+    return f"{int(days or 0) * 24 + int(hours):02d}:{minutes}"
+
+
+def _register_time_periods(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return the distinct time-of-use windows of a register's rows."""
+    periods: list[dict[str, Any]] = []
+    for row in rows:
+        raw_periods = row.get("timePeriods")
+        if not isinstance(raw_periods, list):
+            continue
+        for period in raw_periods:
+            if not isinstance(period, dict):
+                continue
+            item = {
+                "start": _time_of_day(period.get("startTime")),
+                "end": _time_of_day(period.get("endTime")),
+            }
+            if item not in periods:
+                periods.append(item)
+    return periods
+
+
 def _build_usage_register_summaries(
     rows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Build summaries for every returned usage register/category."""
+    """Build summaries for every returned usage register/category.
+
+    ``register_sensor`` marks the energy registers that get their own sensor:
+    those that share their usage class with another register of the
+    service, such as time-of-use import or feed-in windows. A class with a
+    single register is already covered by the class total sensor.
+    """
     by_register: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         by_register.setdefault(_usage_register_key(row), []).append(row)
+
+    base_slug_counts: dict[str, int] = {}
+    for key in by_register:
+        base_slug = _usage_register_slug(key)
+        base_slug_counts[base_slug] = base_slug_counts.get(base_slug, 0) + 1
 
     summaries: list[dict[str, Any]] = []
     for key in sorted(by_register):
         register_rows = by_register[key]
         first = register_rows[0]
         summary = _build_register_summary(register_rows)
+        slug = _usage_register_slug(key)
+        if base_slug_counts[slug] > 1:
+            # Keys that differ only in case or punctuation: derive the suffix
+            # from the key itself so neither register's ID depends on the
+            # other being present or on sort order.
+            slug = f"{slug}_{hashlib.sha256(key.encode()).hexdigest()[:8]}"
         summaries.append(
             {
                 "key": key,
+                "slug": slug,
                 "suffix": first.get("suffix"),
                 "chargeType": first.get("chargeType"),
                 "chargeCategoryCode": first.get("chargeCategoryCode"),
                 "direction": "export" if _is_export_register(first) else "import",
+                "usage_class": classify_usage_row(first),
+                "time_periods": _register_time_periods(register_rows),
                 **summary,
             }
+        )
+
+    class_counts: dict[str, int] = {}
+    for summary in summaries:
+        usage_class = summary["usage_class"]
+        class_counts[usage_class] = class_counts.get(usage_class, 0) + 1
+    for summary in summaries:
+        usage_class = summary["usage_class"]
+        summary["register_sensor"] = (
+            usage_class != USAGE_CLASS_TRACKING and class_counts[usage_class] > 1
         )
     return summaries
 
@@ -562,32 +717,30 @@ def _build_usage_register_summaries(
 def build_usage_summary(
     usage_payload: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """Build recorder-safe usage summary split by register (E1 import / B1 solar export)."""
-    rows = _payload_data(usage_payload)
-    if not isinstance(rows, list):
-        rows = []
+    """Build a recorder-safe usage summary from the portal's register rows.
 
-    if not rows:
-        return UsageSummary.model_validate(
-            {
-                "days": 0,
-                "total_usage": None,
-                "latest_day": None,
-                "latest_day_usage": None,
-                "daily": [],
-                "latest_intervals": [],
-                "total_export": None,
-                "latest_day_export": None,
-                "export_daily": [],
-                "registers": [],
-            }
-        ).model_dump(mode="json")
+    Rows are split by ``classify_usage_row``: general import, controlled load
+    and export each get their own totals; tracking rows (rewards and add-ons)
+    only appear in ``registers``.
+    """
+    payload_rows = _payload_data(usage_payload)
+    rows = [
+        row
+        for row in (payload_rows if isinstance(payload_rows, list) else [])
+        if isinstance(row, dict)
+    ]
 
-    import_rows = [r for r in rows if not _is_export_register(r)]
-    export_rows = [r for r in rows if _is_export_register(r)]
+    rows_by_class: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        rows_by_class.setdefault(classify_usage_row(row), []).append(row)
 
-    import_summary = _build_register_summary(import_rows)
-    export_summary = _build_register_summary(export_rows)
+    import_summary = _build_register_summary(
+        rows_by_class.get(USAGE_CLASS_GENERAL_IMPORT, [])
+    )
+    export_summary = _build_register_summary(rows_by_class.get(USAGE_CLASS_EXPORT, []))
+    controlled_summary = _build_register_summary(
+        rows_by_class.get(USAGE_CLASS_CONTROLLED_LOAD, [])
+    )
 
     return UsageSummary.model_validate(
         {
@@ -600,6 +753,9 @@ def build_usage_summary(
             "total_export": export_summary["total"],
             "latest_day_export": export_summary["latest_day_usage"],
             "export_daily": export_summary["daily"],
+            "total_controlled_load": controlled_summary["total"],
+            "latest_day_controlled_load": controlled_summary["latest_day_usage"],
+            "controlled_load_daily": controlled_summary["daily"],
             "registers": _build_usage_register_summaries(rows),
         }
     ).model_dump(mode="json")

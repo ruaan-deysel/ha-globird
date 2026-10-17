@@ -1,6 +1,11 @@
 """Public API surface for the GloBird integration client package."""
 
 from .client import (
+    ATTR_RECENT_ROW_LIMIT,
+    USAGE_CLASS_CONTROLLED_LOAD,
+    USAGE_CLASS_EXPORT,
+    USAGE_CLASS_GENERAL_IMPORT,
+    USAGE_CLASS_TRACKING,
     GloBirdApiError,
     GloBirdAuthError,
     GloBirdCaptchaRequired,
@@ -14,6 +19,7 @@ from .client import (
     build_latest_data_status,
     build_usage_summary,
     build_weather_summary,
+    classify_usage_row,
     cost_attributes,
     date_range_for_usage,
     extract_accounts_and_services,
@@ -24,6 +30,11 @@ from .client import (
 )
 
 __all__ = [
+    "ATTR_RECENT_ROW_LIMIT",
+    "USAGE_CLASS_CONTROLLED_LOAD",
+    "USAGE_CLASS_EXPORT",
+    "USAGE_CLASS_GENERAL_IMPORT",
+    "USAGE_CLASS_TRACKING",
     "GloBirdApiError",
     "GloBirdAuthError",
     "GloBirdCaptchaRequired",
@@ -37,6 +48,7 @@ __all__ = [
     "build_latest_data_status",
     "build_usage_summary",
     "build_weather_summary",
+    "classify_usage_row",
     "cost_attributes",
     "date_range_for_usage",
     "extract_accounts_and_services",

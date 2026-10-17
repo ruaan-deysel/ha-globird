@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from collections.abc import Callable
@@ -36,6 +37,8 @@ from homeassistant.util import dt as dt_util
 from homeassistant.util.unit_conversion import EnergyConverter, VolumeConverter
 
 from .client import (
+    ATTR_RECENT_ROW_LIMIT,
+    USAGE_CLASS_CONTROLLED_LOAD,
     build_billing_period_projection,
     build_latest_data_status,
     cost_attributes,
@@ -57,8 +60,10 @@ ZEROHERO_STATUS_OPTIONS: list[str] = [
     "unknown",
 ]
 ZEROHERO_RESULT_CUTOFF = dt_time(hour=21)
-# Earliest time searched for stored gas statistics rows.
-GAS_STATISTICS_EPOCH = datetime(2000, 1, 1, tzinfo=UTC)
+# Earliest time searched for stored statistics rows.
+STATISTICS_EPOCH = datetime(2000, 1, 1, tzinfo=UTC)
+# Longest wait for the recorder to commit an import before the next upload.
+RECORDER_COMMIT_TIMEOUT = 60
 
 
 def _latest_data_status(detail: dict[str, Any]) -> dict[str, Any]:
@@ -376,8 +381,18 @@ def _build_daily_cumulative_statistics(
     date_key: str,
     value_key: str,
     tzinfo: Any,
+    stored_sum: float | None = None,
 ) -> list[StatisticData]:
-    """Build cumulative daily statistics for Energy Dashboard consumption or cost."""
+    """Build cumulative daily statistics for Energy Dashboard consumption or cost.
+
+    ``state`` is the day's value and ``sum`` the running total. The portal
+    only returns a rolling window of days, so ``stored_sum`` is the ``sum``
+    of the last stored row before the first day here: the running total
+    continues from it instead of restarting when the window moves past the
+    oldest day. Without it the first row's ``sum`` is its own day value, so
+    first-day usage still counts on the first import. Rows that are already
+    wrong outside the window are not repaired.
+    """
     by_day: dict[date, float] = {}
     for row in daily_rows:
         if not isinstance(row, dict):
@@ -391,7 +406,7 @@ def _build_daily_cumulative_statistics(
     if not by_day:
         return []
 
-    cumulative_sum = 0.0
+    cumulative_sum = stored_sum or 0.0
     result: list[StatisticData] = []
     for day in sorted(by_day):
         day_value = round(by_day[day], 3)
@@ -544,6 +559,68 @@ GLOBAL_SENSORS: tuple[GloBirdSensorDescription, ...] = (
 )
 
 
+def _register_unique_id(config_entry: ConfigEntry, sid: str, slug: str) -> str:
+    """Return the unique ID of a per-register usage sensor."""
+    return f"{config_entry.entry_id}_service_{sid}_register_{slug}"
+
+
+def _dynamic_usage_entities(
+    coordinator: GloBirdCoordinator,
+    config_entry: ConfigEntry,
+    known_unique_ids: set[str],
+) -> list[SensorEntity]:
+    """Return usage sensors for registers the portal returns that are new.
+
+    Controlled-load sensors exist only for services with controlled-load
+    registers, and register sensors only for registers flagged
+    ``register_sensor``. ``known_unique_ids`` is updated so a later refresh
+    never adds the same entity twice.
+    """
+    data = coordinator.data or {}
+    service_data = data.get("service_data") or {}
+    entities: list[SensorEntity] = []
+    for service in data.get("services", []):
+        if _is_gas_service(service):
+            continue
+        sid = service_id(service)
+        detail = service_data.get(sid)
+        summary = (
+            detail.get("usage_summary") if isinstance(detail, dict) else None
+        ) or {}
+        registers = [
+            register
+            for register in summary.get("registers") or []
+            if isinstance(register, dict)
+        ]
+        candidates: list[GloBirdServiceBaseSensor] = []
+        if any(
+            register.get("usage_class") == USAGE_CLASS_CONTROLLED_LOAD
+            for register in registers
+        ):
+            candidates.extend(
+                [
+                    GloBirdControlledLoadTotalSensor(
+                        coordinator, config_entry, service
+                    ),
+                    GloBirdLatestDayControlledLoadSensor(
+                        coordinator, config_entry, service
+                    ),
+                ]
+            )
+        candidates.extend(
+            GloBirdUsageRegisterSensor(coordinator, config_entry, service, register)
+            for register in registers
+            if register.get("register_sensor")
+        )
+        for entity in candidates:
+            unique_id = str(entity.unique_id)
+            if unique_id in known_unique_ids:
+                continue
+            known_unique_ids.add(unique_id)
+            entities.append(entity)
+    return entities
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     config_entry: ConfigEntry,
@@ -631,7 +708,25 @@ async def async_setup_entry(
 
         entities.extend(service_entities)
 
+    # Usage sensors that depend on the registers the portal returns. Plans
+    # can add registers later, so check again after every refresh.
+    known_unique_ids: set[str] = set()
+    entities.extend(
+        _dynamic_usage_entities(coordinator, config_entry, known_unique_ids)
+    )
     async_add_entities(entities)
+
+    @callback
+    def _async_add_new_usage_entities() -> None:
+        new_entities = _dynamic_usage_entities(
+            coordinator, config_entry, known_unique_ids
+        )
+        if new_entities:
+            async_add_entities(new_entities)
+
+    config_entry.async_on_unload(
+        coordinator.async_add_listener(_async_add_new_usage_entities)
+    )
 
 
 class GloBirdBaseSensor(CoordinatorEntity[GloBirdCoordinator], SensorEntity):
@@ -791,6 +886,48 @@ class GloBirdServiceBaseSensor(GloBirdBaseSensor):
             "account_number": service.get("accountNumber"),
         }
 
+    async def _async_stored_rows_before(
+        self, statistic_id: str, before: datetime, types: set[str]
+    ) -> list[StatisticData]:
+        """Return the stored statistic rows that start before ``before``.
+
+        The portal only returns a rolling window, so rows older than the
+        window are no longer imported and the next upload must continue from
+        the last of them. ``types`` are the statistic columns a row needs
+        (``sum``, and ``state`` for gas); rows missing one are left out.
+        Exceptions are not caught: each caller skips its import instead.
+        """
+        from homeassistant.components.recorder.statistics import (
+            statistics_during_period,
+        )
+        from homeassistant.helpers.recorder import get_instance
+
+        stored = await get_instance(self.hass).async_add_executor_job(
+            statistics_during_period,
+            self.hass,
+            STATISTICS_EPOCH,
+            before,
+            {statistic_id},
+            "hour",
+            None,
+            types,
+        )
+        rows: list[StatisticData] = []
+        for row in stored.get(statistic_id) or []:
+            start = row.get("start")
+            total = row.get("sum")
+            state = row.get("state")
+            if start is None or total is None or ("state" in types and state is None):
+                continue
+            item = StatisticData(
+                start=datetime.fromtimestamp(float(start), UTC),
+                sum=float(total),
+            )
+            if state is not None and "state" in types:
+                item["state"] = float(state)
+            rows.append(item)
+        return rows
+
     async def _async_upload_daily_external_statistics(
         self,
         daily_rows: list[dict[str, Any]],
@@ -810,20 +947,44 @@ class GloBirdServiceBaseSensor(GloBirdBaseSensor):
         except ImportError:
             return
 
-        statistics = _build_daily_cumulative_statistics(
-            daily_rows,
-            date_key=date_key,
-            value_key=value_key,
-            tzinfo=dt_util.now().tzinfo or UTC,
-        )
-        if not statistics:
-            return
-
         statistic_suffix = _safe_statistic_id(
             getattr(self, "_attr_unique_id", self._service_id),
             self._service_id,
         )
         statistic_id = f"{DOMAIN}:{statistic_suffix}"
+        tzinfo = dt_util.now().tzinfo or UTC
+        statistics = _build_daily_cumulative_statistics(
+            daily_rows,
+            date_key=date_key,
+            value_key=value_key,
+            tzinfo=tzinfo,
+        )
+        if not statistics:
+            return
+
+        try:
+            stored_rows = await self._async_stored_rows_before(
+                statistic_id, statistics[0]["start"], {"sum"}
+            )
+        except Exception as err:
+            # Never rewrite stored rows without knowing where the sum must
+            # continue from; retry on the next coordinator update.
+            _LOGGER.warning(
+                "GloBird external statistics import skipped for %s (%s): could not read stored statistics: %s",
+                self._service_id,
+                statistic_id,
+                err,
+            )
+            return
+        if stored_rows:
+            statistics = _build_daily_cumulative_statistics(
+                daily_rows,
+                date_key=date_key,
+                value_key=value_key,
+                tzinfo=tzinfo,
+                stored_sum=stored_rows[-1].get("sum"),
+            )
+
         metadata = StatisticMetaData(
             has_mean=False,
             mean_type=StatisticMeanType.NONE,
@@ -847,6 +1008,75 @@ class GloBirdServiceBaseSensor(GloBirdBaseSensor):
                 statistic_id,
                 err,
             )
+            return
+        await self._async_wait_for_statistics_commit(statistic_id)
+
+    async def _async_wait_for_statistics_commit(self, statistic_id: str) -> None:
+        """Wait until the recorder has committed the queued statistics import.
+
+        ``async_add_external_statistics`` only queues an import task. The
+        recorder runs its queue in order, and a commit future resolves once
+        every task queued before it has run and been committed, so the next
+        upload's stored-row lookup sees these rows. An import the recorder
+        queues again after a database error runs after the future; the next
+        refresh uploads the window again. The wait is bounded so a stuck
+        recorder cannot hold the upload lock forever.
+        """
+        from homeassistant.helpers.recorder import get_instance
+
+        try:
+            future = get_instance(self.hass).async_get_commit_future()
+            if future is not None:
+                async with asyncio.timeout(RECORDER_COMMIT_TIMEOUT):
+                    await future
+        except Exception as err:
+            _LOGGER.debug(
+                "GloBird statistics import for %s (%s) not confirmed as committed: %r",
+                self._service_id,
+                statistic_id,
+                err,
+            )
+
+
+class GloBirdDailyStatisticsSensor(GloBirdServiceBaseSensor):
+    """Service sensor that imports a daily series as external statistics.
+
+    The series is uploaded when the entity is added and after every
+    coordinator update. Subclasses implement ``_async_upload_statistics``.
+    Uploads of one entity run one at a time, so reading the stored row that
+    anchors the sum and writing the new rows cannot interleave with another
+    upload.
+    """
+
+    def __init__(
+        self,
+        coordinator: GloBirdCoordinator,
+        config_entry: ConfigEntry,
+        service: dict[str, Any],
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, config_entry, service)
+        self._statistics_lock = asyncio.Lock()
+
+    async def async_added_to_hass(self) -> None:
+        """Upload the daily series to recorder long-term statistics."""
+        await super().async_added_to_hass()
+        await self._async_upload_statistics_serialised()
+
+    def _handle_coordinator_update(self) -> None:
+        """Refresh the entity and import newly published statistics."""
+        super()._handle_coordinator_update()
+        if hasattr(self.hass, "async_create_task"):
+            self.hass.async_create_task(self._async_upload_statistics_serialised())
+
+    async def _async_upload_statistics_serialised(self) -> None:
+        """Upload the daily series after any earlier upload has finished."""
+        async with self._statistics_lock:
+            await self._async_upload_statistics()
+
+    async def _async_upload_statistics(self) -> None:
+        """Upload this sensor's daily series."""
+        raise NotImplementedError
 
 
 class GloBirdServiceStatusSensor(GloBirdServiceBaseSensor):
@@ -1030,7 +1260,7 @@ class GloBirdLatestGasReadingSensor(GloBirdServiceBaseSensor):
         statistic_id = f"{DOMAIN}:{statistic_suffix}"
         try:
             stored_rows = await self._async_stored_rows_before(
-                statistic_id, statistics[0]["start"]
+                statistic_id, statistics[0]["start"], {"state", "sum"}
             )
         except Exception as err:
             # Never rewrite stored rows without knowing where the sum must
@@ -1057,7 +1287,8 @@ class GloBirdLatestGasReadingSensor(GloBirdServiceBaseSensor):
             statistics = _build_gas_statistics(
                 history_rows,
                 tzinfo=tzinfo,
-                stored_before=(last["state"], last["sum"]),
+                # The lookup only returns gas rows with a state and a sum.
+                stored_before=(last.get("state") or 0.0, last.get("sum") or 0.0),
             )
         statistics = rebased_rows + statistics
         metadata = StatisticMetaData(
@@ -1091,45 +1322,6 @@ class GloBirdLatestGasReadingSensor(GloBirdServiceBaseSensor):
                 statistic_id,
                 err,
             )
-
-    async def _async_stored_rows_before(
-        self, statistic_id: str, before: datetime
-    ) -> list[StatisticData]:
-        """Return the stored gas rows that start before ``before``.
-
-        Rows older than the portal's read window are no longer imported, so
-        the new rows must continue from the last of them. Rows without a
-        state or sum are left out.
-        """
-        from homeassistant.components.recorder.statistics import (
-            statistics_during_period,
-        )
-        from homeassistant.helpers.recorder import get_instance
-
-        stored = await get_instance(self.hass).async_add_executor_job(
-            statistics_during_period,
-            self.hass,
-            GAS_STATISTICS_EPOCH,
-            before,
-            {statistic_id},
-            "hour",
-            None,
-            {"state", "sum"},
-        )
-        rows: list[StatisticData] = []
-        for row in stored.get(statistic_id) or []:
-            state = row.get("state")
-            total = row.get("sum")
-            if state is None or total is None:
-                continue
-            rows.append(
-                StatisticData(
-                    start=datetime.fromtimestamp(float(row["start"]), UTC),
-                    state=float(state),
-                    sum=float(total),
-                )
-            )
-        return rows
 
     @property
     def native_value(self) -> Any:
@@ -1191,7 +1383,7 @@ class GloBirdLatestGasReadingDateSensor(GloBirdServiceBaseSensor):
         return attrs
 
 
-class GloBirdUsageTotalSensor(GloBirdServiceBaseSensor):
+class GloBirdUsageTotalSensor(GloBirdDailyStatisticsSensor):
     """Recent usage total sensor (supports HA Energy Dashboard grid consumption)."""
 
     sensor_key = "usage_total"
@@ -1200,17 +1392,6 @@ class GloBirdUsageTotalSensor(GloBirdServiceBaseSensor):
     sensor_unit = UnitOfEnergy.KILO_WATT_HOUR
     sensor_device_class = SensorDeviceClass.ENERGY
     sensor_state_class = SensorStateClass.TOTAL
-
-    async def async_added_to_hass(self) -> None:
-        """Upload historical daily usage to recorder long-term statistics."""
-        await super().async_added_to_hass()
-        await self._async_upload_statistics()
-
-    def _handle_coordinator_update(self) -> None:
-        """Refresh the entity and import newly published usage statistics."""
-        super()._handle_coordinator_update()
-        if hasattr(self.hass, "async_create_task"):
-            self.hass.async_create_task(self._async_upload_statistics())
 
     async def _async_upload_statistics(self) -> None:
         """Upload daily electricity import statistics."""
@@ -1276,7 +1457,7 @@ class GloBirdLatestDayUsageSensor(GloBirdServiceBaseSensor):
         return attrs
 
 
-class GloBirdSolarExportTotalSensor(GloBirdServiceBaseSensor):
+class GloBirdSolarExportTotalSensor(GloBirdDailyStatisticsSensor):
     """Recent solar export total sensor (B1 register, supports Energy Dashboard Return to Grid)."""
 
     sensor_key = "solar_export_total"
@@ -1285,17 +1466,6 @@ class GloBirdSolarExportTotalSensor(GloBirdServiceBaseSensor):
     sensor_unit = UnitOfEnergy.KILO_WATT_HOUR
     sensor_device_class = SensorDeviceClass.ENERGY
     sensor_state_class = SensorStateClass.TOTAL
-
-    async def async_added_to_hass(self) -> None:
-        """Upload historical daily solar export to recorder long-term statistics."""
-        await super().async_added_to_hass()
-        await self._async_upload_statistics()
-
-    def _handle_coordinator_update(self) -> None:
-        """Refresh the entity and import newly published solar export statistics."""
-        super()._handle_coordinator_update()
-        if hasattr(self.hass, "async_create_task"):
-            self.hass.async_create_task(self._async_upload_statistics())
 
     async def _async_upload_statistics(self) -> None:
         """Upload daily solar export statistics."""
@@ -1361,7 +1531,173 @@ class GloBirdLatestDaySolarExportSensor(GloBirdServiceBaseSensor):
         return attrs
 
 
-class GloBirdCostTotalSensor(GloBirdServiceBaseSensor):
+class GloBirdControlledLoadTotalSensor(GloBirdDailyStatisticsSensor):
+    """Recent controlled-load usage total (separately metered off-peak circuit).
+
+    Created only for services that return controlled-load registers.
+    """
+
+    sensor_key = "controlled_load_total"
+    sensor_name = "Recent Controlled Load Total"
+    sensor_icon = "mdi:water-boiler"
+    sensor_unit = UnitOfEnergy.KILO_WATT_HOUR
+    sensor_device_class = SensorDeviceClass.ENERGY
+    sensor_state_class = SensorStateClass.TOTAL
+
+    async def _async_upload_statistics(self) -> None:
+        """Upload daily controlled-load statistics."""
+        summary = self._service_detail().get("usage_summary") or {}
+        await self._async_upload_daily_external_statistics(
+            summary.get("controlled_load_daily") or [],
+            date_key="readDate",
+            value_key="usage",
+            unit_class=EnergyConverter.UNIT_CLASS,
+        )
+
+    @property
+    def native_value(self) -> Any:
+        """Return total recent controlled-load usage."""
+        detail = self._service_detail()
+        val = (detail.get("usage_summary") or {}).get("total_controlled_load")
+        return val if val is not None else (0.0 if detail else None)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return controlled-load summary attributes."""
+        attrs = self._service_attrs()
+        summary = self._service_detail().get("usage_summary") or {}
+        attrs.update(usage_attributes(summary, direction="controlled_load"))
+        return attrs
+
+
+class GloBirdLatestDayControlledLoadSensor(GloBirdServiceBaseSensor):
+    """Latest day controlled-load usage."""
+
+    sensor_key = "latest_day_controlled_load"
+    sensor_name = "Latest Day Controlled Load"
+    sensor_icon = "mdi:water-boiler"
+    sensor_unit = UnitOfEnergy.KILO_WATT_HOUR
+    sensor_device_class = SensorDeviceClass.ENERGY
+    sensor_state_class = SensorStateClass.TOTAL
+
+    @property
+    def last_reset(self) -> datetime | None:
+        """Return midnight of the latest controlled-load day."""
+        summary = self._service_detail().get("usage_summary") or {}
+        daily = summary.get("controlled_load_daily") or []
+        latest = daily[-1] if daily and isinstance(daily[-1], dict) else {}
+        return _day_reset_timestamp(latest.get("readDate"))
+
+    @property
+    def native_value(self) -> Any:
+        """Return latest day controlled-load usage."""
+        return (self._service_detail().get("usage_summary") or {}).get(
+            "latest_day_controlled_load"
+        )
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return latest day controlled-load attributes."""
+        attrs = self._service_attrs()
+        summary = self._service_detail().get("usage_summary") or {}
+        attrs.update(usage_attributes(summary, direction="controlled_load"))
+        return attrs
+
+
+class GloBirdUsageRegisterSensor(GloBirdDailyStatisticsSensor):
+    """Recent usage of one portal register, such as a time-of-use window.
+
+    Created for energy registers that share their usage class with another
+    register (see ``register_sensor`` in the usage summary). The entity is
+    unavailable while the portal does not return its register.
+    """
+
+    sensor_key = "usage_register"
+    sensor_name = "Usage Register"
+    sensor_icon = "mdi:chart-timeline-variant"
+    sensor_unit = UnitOfEnergy.KILO_WATT_HOUR
+    sensor_device_class = SensorDeviceClass.ENERGY
+    sensor_state_class = SensorStateClass.TOTAL
+
+    def __init__(
+        self,
+        coordinator: GloBirdCoordinator,
+        config_entry: ConfigEntry,
+        service: dict[str, Any],
+        register: dict[str, Any],
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, config_entry, service)
+        self._slug = str(register.get("slug") or "unknown")
+        self._attr_unique_id = _register_unique_id(
+            config_entry, self._service_id, self._slug
+        )
+        label = " ".join(
+            str(part).strip()
+            for part in (register.get("suffix"), register.get("chargeType"))
+            if part and str(part).strip()
+        )
+        self._attr_name = f"Recent {label or self._slug}"
+        if register.get("direction") == "export":
+            self._attr_icon = "mdi:solar-power"
+
+    def _register(self) -> dict[str, Any] | None:
+        """Return this sensor's register from the latest usage summary."""
+        summary = self._service_detail().get("usage_summary") or {}
+        for register in summary.get("registers") or []:
+            if isinstance(register, dict) and register.get("slug") == self._slug:
+                return register
+        return None
+
+    @property
+    def available(self) -> bool:
+        """Return whether the portal still returns this register."""
+        return bool(super().available) and self._register() is not None
+
+    async def _async_upload_statistics(self) -> None:
+        """Upload this register's daily usage statistics."""
+        register = self._register()
+        if register is None:
+            return
+        await self._async_upload_daily_external_statistics(
+            register.get("daily") or [],
+            date_key="readDate",
+            value_key="usage",
+            unit_class=EnergyConverter.UNIT_CLASS,
+        )
+
+    @property
+    def native_value(self) -> Any:
+        """Return the register's recent usage total."""
+        register = self._register()
+        return register.get("total") if register else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return register metadata, time-of-use windows and recent days."""
+        attrs = self._service_attrs()
+        register = self._register() or {}
+        daily = register.get("daily")
+        daily_rows = daily if isinstance(daily, list) else []
+        attrs.update(
+            {
+                "register_key": register.get("key"),
+                "suffix": register.get("suffix"),
+                "chargeType": register.get("chargeType"),
+                "chargeCategoryCode": register.get("chargeCategoryCode"),
+                "direction": register.get("direction"),
+                "usage_class": register.get("usage_class"),
+                "time_periods": register.get("time_periods") or [],
+                "latest_day": register.get("latest_day"),
+                "latest_day_usage": register.get("latest_day_usage"),
+                "daily": daily_rows[-ATTR_RECENT_ROW_LIMIT:],
+                "daily_count": len(daily_rows),
+            }
+        )
+        return attrs
+
+
+class GloBirdCostTotalSensor(GloBirdDailyStatisticsSensor):
     """Recent cost total sensor (compatible with HA Energy Dashboard total cost tracking)."""
 
     sensor_key = "cost_total"
@@ -1370,17 +1706,6 @@ class GloBirdCostTotalSensor(GloBirdServiceBaseSensor):
     sensor_unit = CURRENCY_AUD
     sensor_device_class = SensorDeviceClass.MONETARY
     sensor_state_class = SensorStateClass.TOTAL
-
-    async def async_added_to_hass(self) -> None:
-        """Upload historical daily cost totals to recorder long-term statistics."""
-        await super().async_added_to_hass()
-        await self._async_upload_statistics()
-
-    def _handle_coordinator_update(self) -> None:
-        """Refresh the entity and import newly published cost statistics."""
-        super()._handle_coordinator_update()
-        if hasattr(self.hass, "async_create_task"):
-            self.hass.async_create_task(self._async_upload_statistics())
 
     async def _async_upload_statistics(self) -> None:
         """Upload daily cost statistics."""
@@ -1451,7 +1776,7 @@ class GloBirdLatestDayCostSensor(GloBirdServiceBaseSensor):
         return attrs
 
 
-class GloBirdSolarExportCreditTotalSensor(GloBirdServiceBaseSensor):
+class GloBirdSolarExportCreditTotalSensor(GloBirdDailyStatisticsSensor):
     """Recent solar export compensation total sensor for the HA Energy Dashboard."""
 
     sensor_key = "solar_export_credit_total"
@@ -1460,17 +1785,6 @@ class GloBirdSolarExportCreditTotalSensor(GloBirdServiceBaseSensor):
     sensor_unit = CURRENCY_AUD
     sensor_device_class = SensorDeviceClass.MONETARY
     sensor_state_class = SensorStateClass.TOTAL
-
-    async def async_added_to_hass(self) -> None:
-        """Upload historical daily solar export credits to recorder long-term statistics."""
-        await super().async_added_to_hass()
-        await self._async_upload_statistics()
-
-    def _handle_coordinator_update(self) -> None:
-        """Refresh the entity and import newly published solar credit statistics."""
-        super()._handle_coordinator_update()
-        if hasattr(self.hass, "async_create_task"):
-            self.hass.async_create_task(self._async_upload_statistics())
 
     async def _async_upload_statistics(self) -> None:
         """Upload daily solar export credit statistics."""

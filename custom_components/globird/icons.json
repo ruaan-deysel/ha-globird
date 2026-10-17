@@ -52,6 +52,15 @@
       "latest_day_solar_export": {
         "default": "mdi:solar-power-variant"
       },
+      "controlled_load_total": {
+        "default": "mdi:water-boiler"
+      },
+      "latest_day_controlled_load": {
+        "default": "mdi:water-boiler"
+      },
+      "usage_register": {
+        "default": "mdi:chart-timeline-variant"
+      },
       "cost_total": {
         "default": "mdi:cash-multiple"
       },

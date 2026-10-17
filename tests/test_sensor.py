@@ -55,6 +55,10 @@ class SensorDeviceClass:
 class SensorEntity:
     """Minimal stand-in for Home Assistant's SensorEntity."""
 
+    @property
+    def unique_id(self) -> str | None:
+        return getattr(self, "_attr_unique_id", None)
+
 
 class SensorStateClass:
     """Minimal sensor state classes used by the integration."""
@@ -87,6 +91,10 @@ class CoordinatorEntity:
 
     def _handle_coordinator_update(self) -> None:
         return None
+
+    @property
+    def available(self) -> bool:
+        return bool(getattr(self.coordinator, "last_update_success", True))
 
 
 class DataUpdateCoordinator:
@@ -188,6 +196,34 @@ sys.modules["homeassistant.util.logging"] = util_logging
 sys.modules["homeassistant.util.unit_conversion"] = unit_conversion
 
 sensor = importlib.import_module("custom_components.globird.sensor")
+client_module = importlib.import_module("custom_components.globird.client")
+ZEROHERO_FIXTURE_PATH = (
+    Path(__file__).parent / "fixtures" / "globird_zerohero_tou_responses.json"
+)
+
+
+class FakeEntry:
+    """Config entry stand-in that records unload callbacks."""
+
+    def __init__(self, entry_id: str = "entry-1", runtime_data: Any = None) -> None:
+        self.entry_id = entry_id
+        self.runtime_data = runtime_data
+        self.unload_callbacks: list[Any] = []
+
+    def async_on_unload(self, func: Any) -> None:
+        self.unload_callbacks.append(func)
+
+
+class ListenerMixin:
+    """Coordinator stand-in support for ``async_add_listener``."""
+
+    listeners: list[Any]
+
+    def async_add_listener(self, listener: Any) -> Any:
+        if not hasattr(self, "listeners"):
+            self.listeners = []
+        self.listeners.append(listener)
+        return lambda: self.listeners.remove(listener)
 
 
 def load_gas_fixtures() -> dict[str, Any]:
@@ -562,11 +598,11 @@ def test_latest_gas_reading_keeps_real_zero_reading() -> None:
     assert _gas_reading_entity({"latest_reading": 0.0}).native_value == 0.0
 
 
-def _install_gas_recorder_stubs(
+def _install_recorder_stubs(
     monkeypatch: Any,
     stored_rows: list[dict[str, Any]] | Exception,
 ) -> tuple[list[tuple[Any, Any]], list[tuple[Any, ...]]]:
-    """Stub the recorder APIs the gas statistics import uses."""
+    """Stub the recorder APIs the statistics imports use."""
     uploaded: list[tuple[Any, Any]] = []
     queries: list[tuple[Any, ...]] = []
 
@@ -582,6 +618,9 @@ def _install_gas_recorder_stubs(
     class FakeRecorder:
         async def async_add_executor_job(self, func: Any, *args: Any) -> Any:
             return func(*args)
+
+        def async_get_commit_future(self) -> Any:
+            return None
 
     statistics_module = types.ModuleType("homeassistant.components.recorder.statistics")
     statistics_module.async_add_external_statistics = add_statistics
@@ -608,7 +647,7 @@ _GAS_HISTORY = {
 
 def test_gas_upload_first_import_starts_sum_at_zero(monkeypatch: Any) -> None:
     """First import: the uploaded sum starts at 0 with the index as state."""
-    uploaded, queries = _install_gas_recorder_stubs(monkeypatch, [])
+    uploaded, queries = _install_recorder_stubs(monkeypatch, [])
     entity = _gas_reading_entity(_GAS_HISTORY)
 
     asyncio.run(entity._async_upload_historical_statistics())
@@ -630,7 +669,7 @@ def test_gas_upload_first_import_starts_sum_at_zero(monkeypatch: Any) -> None:
 
 def test_gas_upload_continues_from_stored_row(monkeypatch: Any) -> None:
     """A stored row before the window anchors the uploaded sums."""
-    uploaded, _queries = _install_gas_recorder_stubs(
+    uploaded, _queries = _install_recorder_stubs(
         monkeypatch,
         [
             {"start": 1.0, "state": 600.0, "sum": 0.0},
@@ -677,7 +716,7 @@ def test_gas_upload_rebases_legacy_rows_outside_window(monkeypatch: Any) -> None
     """Legacy rows outside the window are rewritten once without the index."""
     first = datetime(2025, 10, 1, tzinfo=UTC)
     second = datetime(2025, 12, 1, tzinfo=UTC)
-    uploaded, _queries = _install_gas_recorder_stubs(
+    uploaded, _queries = _install_recorder_stubs(
         monkeypatch,
         [
             {"start": first.timestamp(), "state": 700.0, "sum": 700.0},
@@ -703,7 +742,7 @@ def test_gas_upload_ignores_stored_rows_without_state_or_sum(
         {"start": 1.0, "state": 700.0, "sum": None},
         {"start": 1.0, "state": None, "sum": 100.0},
     ):
-        uploaded, _queries = _install_gas_recorder_stubs(monkeypatch, [stored_row])
+        uploaded, _queries = _install_recorder_stubs(monkeypatch, [stored_row])
         entity = _gas_reading_entity(_GAS_HISTORY)
 
         asyncio.run(entity._async_upload_historical_statistics())
@@ -714,7 +753,7 @@ def test_gas_upload_ignores_stored_rows_without_state_or_sum(
 
 def test_gas_upload_skipped_when_stored_rows_unreadable(monkeypatch: Any) -> None:
     """Rows are never rewritten when the stored anchor cannot be read."""
-    uploaded, _queries = _install_gas_recorder_stubs(
+    uploaded, _queries = _install_recorder_stubs(
         monkeypatch, RuntimeError("database locked")
     )
     entity = _gas_reading_entity(_GAS_HISTORY)
@@ -920,7 +959,7 @@ def test_service_sensors_return_expected_values() -> None:
 def test_async_setup_entry_adds_global_account_and_service_entities() -> None:
     """Setup should create entity instances for global, account, and service sensors."""
 
-    class FakeCoordinator:
+    class FakeCoordinator(ListenerMixin):
         data = {
             "accounts": [
                 {
@@ -962,15 +1001,49 @@ def test_async_setup_entry_adds_global_account_and_service_entities() -> None:
     def add_entities(entities: list[Any]) -> None:
         captured.extend(entities)
 
+    entry = FakeEntry()
     asyncio.run(
         sensor.async_setup_entry(
             types.SimpleNamespace(data=hass),
-            types.SimpleNamespace(entry_id="entry-1"),
+            entry,
             add_entities,
         )
     )
 
     assert captured
+    # Existing entity unique IDs must not change.
+    assert {entity.unique_id for entity in captured} == {
+        "entry-1_balance",
+        "entry-1_dashboard_balance",
+        "entry-1_latest_invoice",
+        "entry-1_signup_services",
+        "entry-1_last_successful_refresh",
+        "entry-1_refresh_status",
+        "entry-1_account_1_summary",
+        *(
+            f"entry-1_service_810965_{key}"
+            for key in (
+                "service_status",
+                "meter_info",
+                "latest_data_date",
+                "latest_data_status",
+                "usage_total",
+                "latest_day_usage",
+                "solar_export_total",
+                "latest_day_solar_export",
+                "cost_total",
+                "latest_day_cost",
+                "solar_export_credit_total",
+                "latest_day_solar_export_credit",
+                "zerohero_status",
+                "expected_month_cost",
+                "billing_period_days",
+                "billing_period_cost",
+                "weather_summary",
+            )
+        ),
+    }
+    assert len(entry.unload_callbacks) == 1
     assert any(isinstance(entity, sensor.GloBirdGlobalSensor) for entity in captured)
     assert any(
         isinstance(entity, sensor.GloBirdAccountSummarySensor) for entity in captured
@@ -1167,7 +1240,7 @@ def test_billing_period_cost_sensor_fallbacks() -> None:
     assert entity.last_reset is None
 
 
-def test_energy_dashboard_sensors_and_external_statistics() -> None:
+def test_energy_dashboard_sensors_and_external_statistics(monkeypatch: Any) -> None:
     """Test Energy Dashboard usage, solar export, cost, and solar credit sensors and external stats."""
     service = {"accountServiceId": 1, "serviceType": "Power", "siteIdentifier": "NMI-1"}
     gas_service = {
@@ -1176,7 +1249,7 @@ def test_energy_dashboard_sensors_and_external_statistics() -> None:
         "siteIdentifier": "MIRN-1",
     }
 
-    class FakeCoordinator:
+    class FakeCoordinator(ListenerMixin):
         data = {
             "last_update": 1700000000.0,
             "dashboard": {
@@ -1233,18 +1306,10 @@ def test_energy_dashboard_sensors_and_external_statistics() -> None:
             },
         }
 
-    recorder_statistics = types.ModuleType(
-        "homeassistant.components.recorder.statistics"
-    )
-    uploaded: list[tuple[Any, Any]] = []
+    uploaded, _queries = _install_recorder_stubs(monkeypatch, [])
+    recorder_statistics = sys.modules["homeassistant.components.recorder.statistics"]
 
-    async def add_ok(_hass: Any, meta: Any, stats: Any) -> None:
-        uploaded.append((meta, stats))
-
-    recorder_statistics.async_add_external_statistics = add_ok
-    sys.modules["homeassistant.components.recorder.statistics"] = recorder_statistics
-
-    entry = types.SimpleNamespace(entry_id="entry-1", runtime_data=FakeCoordinator())
+    entry = FakeEntry(runtime_data=FakeCoordinator())
     added_entities: list[Any] = []
     asyncio.run(
         sensor.async_setup_entry(
@@ -1358,3 +1423,529 @@ def test_energy_dashboard_sensors_and_external_statistics() -> None:
     assert sensor._safe_statistic_id("!!!", "!!!") == "service"
     assert sensor._safe_statistic_id("", "123") == "svc_123"
     assert sensor._build_gas_statistics([], tzinfo=UTC) == []
+
+
+def test_daily_cumulative_statistics_continue_from_stored_sum() -> None:
+    """A stored sum before the window seeds the running total (#21)."""
+    statistics = sensor._build_daily_cumulative_statistics(
+        [
+            {"readDate": "2026-09-26", "usage": 3.5},
+            {"readDate": "2026-09-27", "usage": 4.25},
+        ],
+        date_key="readDate",
+        value_key="usage",
+        tzinfo=UTC,
+        stored_sum=10.0,
+    )
+
+    assert [row["state"] for row in statistics] == [3.5, 4.25]
+    assert [row["sum"] for row in statistics] == [13.5, 17.75]
+
+
+_POWER_SERVICE = {"accountServiceId": 1, "serviceType": "Power", "siteIdentifier": "N1"}
+
+
+class _UsageCoordinator(ListenerMixin):
+    """Coordinator stand-in holding one electricity service's usage summary."""
+
+    last_update_success = True
+
+    def __init__(self, usage_summary: dict[str, Any]) -> None:
+        self.data: dict[str, Any] = {
+            "services": [_POWER_SERVICE],
+            "service_data": {
+                "1": {"service": _POWER_SERVICE, "usage_summary": usage_summary}
+            },
+        }
+
+    def set_summary(self, usage_summary: dict[str, Any]) -> None:
+        self.data["service_data"]["1"]["usage_summary"] = usage_summary
+
+
+def _usage_total_entity(daily: list[dict[str, Any]]) -> Any:
+    """Return a Recent Usage Total entity for the given daily rows."""
+    return sensor.GloBirdUsageTotalSensor(
+        _UsageCoordinator({"daily": daily}), FakeEntry(), _POWER_SERVICE
+    )
+
+
+_DAILY = [
+    {"readDate": "2026/10/01", "usage": 2.0},
+    {"readDate": "2026/10/02", "usage": 3.0},
+]
+
+
+def test_daily_upload_first_import_starts_at_first_day(monkeypatch: Any) -> None:
+    """Without stored rows the first sum is the first day's usage."""
+    uploaded, queries = _install_recorder_stubs(monkeypatch, [])
+
+    asyncio.run(_usage_total_entity(_DAILY)._async_upload_statistics())
+
+    metadata, rows = uploaded[0]
+    assert metadata["statistic_id"] == "globird:entry_1_service_1_usage_total"
+    assert [row["sum"] for row in rows] == [2.0, 5.0]
+    assert queries[0][3] == {metadata["statistic_id"]}
+    assert queries[0][2] == rows[0]["start"]
+    assert queries[0][6] == {"sum"}
+
+
+def test_daily_upload_continues_from_stored_row(monkeypatch: Any) -> None:
+    """The last stored row before the window anchors the uploaded sums."""
+    uploaded, _queries = _install_recorder_stubs(
+        monkeypatch,
+        [
+            {"start": 1.0, "state": 1.0, "sum": 40.0},
+            {"start": 2.0, "state": None, "sum": 50.5},
+            {"start": 3.0, "state": 1.0, "sum": None},
+        ],
+    )
+
+    asyncio.run(_usage_total_entity(_DAILY)._async_upload_statistics())
+
+    assert [row["sum"] for row in uploaded[0][1]] == [52.5, 55.5]
+
+
+def test_daily_upload_ignores_stored_rows_without_sum(monkeypatch: Any) -> None:
+    """Stored rows without a sum do not anchor the upload."""
+    uploaded, _queries = _install_recorder_stubs(
+        monkeypatch, [{"start": 1.0, "state": 1.0, "sum": None}]
+    )
+
+    asyncio.run(_usage_total_entity(_DAILY)._async_upload_statistics())
+
+    assert [row["sum"] for row in uploaded[0][1]] == [2.0, 5.0]
+
+
+def test_daily_upload_skipped_when_stored_rows_unreadable(monkeypatch: Any) -> None:
+    """An unreadable recorder skips the import instead of rewriting rows."""
+    uploaded, _queries = _install_recorder_stubs(
+        monkeypatch, RuntimeError("database locked")
+    )
+
+    asyncio.run(_usage_total_entity(_DAILY)._async_upload_statistics())
+
+    assert uploaded == []
+
+
+def test_daily_upload_continues_when_window_moves(monkeypatch: Any) -> None:
+    """Two refreshes whose windows differ by a day keep one continuous sum."""
+    stored: list[dict[str, Any]] = []
+    uploaded, _queries = _install_recorder_stubs(monkeypatch, stored)
+
+    asyncio.run(_usage_total_entity(_DAILY)._async_upload_statistics())
+    first_rows = uploaded[0][1]
+    # The recorder keeps day 1; the next window starts at day 2.
+    stored.append(
+        {
+            "start": first_rows[0]["start"].timestamp(),
+            "state": first_rows[0]["state"],
+            "sum": first_rows[0]["sum"],
+        }
+    )
+    asyncio.run(
+        _usage_total_entity(
+            [*_DAILY[1:], {"readDate": "2026/10/03", "usage": 4.0}]
+        )._async_upload_statistics()
+    )
+
+    assert [row["sum"] for row in uploaded[1][1]] == [5.0, 9.0]
+
+
+def _zerohero_usage_summary() -> dict[str, Any]:
+    """Return the usage summary built from the redacted live ZEROHERO fixture."""
+    fixtures = json.loads(ZEROHERO_FIXTURE_PATH.read_text())
+    return client_module.build_usage_summary(fixtures["electricity_usage"])
+
+
+def _setup_usage_entities(coordinator: Any) -> tuple[list[Any], FakeEntry]:
+    """Run sensor setup and return the usage entities it added."""
+    entry = FakeEntry(runtime_data=coordinator)
+    added: list[Any] = []
+    asyncio.run(
+        sensor.async_setup_entry(types.SimpleNamespace(data={}), entry, added.extend)
+    )
+    return added, entry
+
+
+def _register_entities(entities: list[Any]) -> dict[str, Any]:
+    """Return per-register and controlled-load entities keyed by unique ID."""
+    return {
+        entity.unique_id: entity
+        for entity in entities
+        if isinstance(
+            entity,
+            (
+                sensor.GloBirdUsageRegisterSensor,
+                sensor.GloBirdControlledLoadTotalSensor,
+                sensor.GloBirdLatestDayControlledLoadSensor,
+            ),
+        )
+    }
+
+
+def test_setup_adds_register_sensors_for_time_of_use_registers(
+    monkeypatch: Any,
+) -> None:
+    """Live ZEROHERO shape: one sensor per TOU import and feed-in window (#18)."""
+    coordinator = _UsageCoordinator(_zerohero_usage_summary())
+    added, _entry = _setup_usage_entities(coordinator)
+    registers = _register_entities(added)
+
+    assert sorted(registers) == [
+        "entry-1_service_1_register_b1_solar_generation_feed_in_11pm_4pm",
+        "entry-1_service_1_register_b1_solar_generation_feed_in_4pm_11pm",
+        "entry-1_service_1_register_e1_offpeak_usage",
+        "entry-1_service_1_register_e1_peak_usage",
+        "entry-1_service_1_register_e1_shoulder_usage",
+    ]
+    offpeak = registers["entry-1_service_1_register_e1_offpeak_usage"]
+    assert offpeak._attr_name == "Recent E1 Offpeak Usage"
+    assert offpeak.available is True
+    assert offpeak.native_value == 0.082
+    attrs = offpeak.extra_state_attributes
+    assert attrs["time_periods"] == [{"start": "12:00", "end": "15:00"}]
+    assert attrs["usage_class"] == "general_import"
+    assert attrs["latest_day"] == "2026/10/16"
+    assert attrs["daily_count"] == 3
+    feed_in = registers[
+        "entry-1_service_1_register_b1_solar_generation_feed_in_4pm_11pm"
+    ]
+    assert feed_in._attr_icon == "mdi:solar-power"
+    assert feed_in._attr_name == "Recent B1 Solar/Generation Feed in (4pm-11pm)"
+
+    uploaded, _queries = _install_recorder_stubs(monkeypatch, [])
+    asyncio.run(offpeak._async_upload_statistics())
+    metadata, rows = uploaded[0]
+    assert metadata["statistic_id"] == (
+        "globird:entry_1_service_1_register_e1_offpeak_usage"
+    )
+    assert metadata["name"] == "Recent E1 Offpeak Usage"
+    assert [row["state"] for row in rows] == [0.078, 0.002, 0.002]
+    assert [row["sum"] for row in rows] == [0.078, 0.08, 0.082]
+
+
+def test_setup_adds_no_register_sensors_for_flat_rate() -> None:
+    """Flat-rate accounts (one register per class) get no extra sensors."""
+    summary = client_module.build_usage_summary(
+        {
+            "data": [
+                {
+                    "readDate": "2026/10/01",
+                    "usage": 1.0,
+                    "suffix": "E1",
+                    "chargeType": "Usage",
+                    "chargeCategoryCode": "USAGE",
+                },
+                {
+                    "readDate": "2026/10/01",
+                    "usage": 2.0,
+                    "suffix": "B1",
+                    "chargeType": "Feed in",
+                    "chargeCategoryCode": "SOLAR",
+                },
+            ]
+        }
+    )
+
+    added, _entry = _setup_usage_entities(_UsageCoordinator(summary))
+
+    assert _register_entities(added) == {}
+
+
+def test_controlled_load_sensors_follow_controlled_load_registers(
+    monkeypatch: Any,
+) -> None:
+    """Controlled-load sensors exist only once the portal returns such a register."""
+    flat = client_module.build_usage_summary(
+        {
+            "data": [
+                {
+                    "readDate": "2026/10/01",
+                    "usage": 5.0,
+                    "suffix": "E1",
+                    "chargeType": "Usage",
+                    "chargeCategoryCode": "USAGE",
+                }
+            ]
+        }
+    )
+    controlled = client_module.build_usage_summary(
+        {
+            "data": [
+                {
+                    "readDate": "2026/10/01",
+                    "usage": 5.0,
+                    "suffix": "E1",
+                    "chargeType": "Usage",
+                    "chargeCategoryCode": "USAGE",
+                },
+                {
+                    "readDate": "2026/10/01",
+                    "usage": 2.5,
+                    "suffix": "E2",
+                    "chargeType": "Controlled Load",
+                    "chargeCategoryCode": "CONTROL",
+                },
+            ]
+        }
+    )
+    coordinator = _UsageCoordinator(flat)
+    added: list[Any] = []
+    entry = FakeEntry(runtime_data=coordinator)
+    asyncio.run(
+        sensor.async_setup_entry(types.SimpleNamespace(data={}), entry, added.extend)
+    )
+    assert _register_entities(added) == {}
+
+    # A refresh that returns the controlled-load register adds its sensors once.
+    coordinator.set_summary(controlled)
+    for listener in list(coordinator.listeners):
+        listener()
+        listener()
+    new = _register_entities(added)
+    assert sorted(new) == [
+        "entry-1_service_1_controlled_load_total",
+        "entry-1_service_1_latest_day_controlled_load",
+    ]
+    total = new["entry-1_service_1_controlled_load_total"]
+    latest = new["entry-1_service_1_latest_day_controlled_load"]
+    assert total.native_value == 2.5
+    assert [r["key"] for r in total.extra_state_attributes["registers"]] == [
+        "E2-Controlled Load"
+    ]
+    assert latest.native_value == 2.5
+    assert latest.last_reset is not None
+    assert latest.extra_state_attributes["daily_count"] == 1
+    usage_total = sensor.GloBirdUsageTotalSensor(coordinator, entry, _POWER_SERVICE)
+    assert usage_total.native_value == 5.0
+    uploaded, _queries = _install_recorder_stubs(monkeypatch, [])
+    asyncio.run(total._async_upload_statistics())
+    assert uploaded[0][0]["statistic_id"] == (
+        "globird:entry_1_service_1_controlled_load_total"
+    )
+    assert [row["sum"] for row in uploaded[0][1]] == [2.5]
+
+    # Unloading the entry removes the listener.
+    entry.unload_callbacks[0]()
+    assert coordinator.listeners == []
+
+
+def test_register_sensor_unavailable_while_register_missing(monkeypatch: Any) -> None:
+    """A register that disappears makes its entity unavailable, not an error."""
+    summary = _zerohero_usage_summary()
+    coordinator = _UsageCoordinator(summary)
+    added, _entry = _setup_usage_entities(coordinator)
+    peak = _register_entities(added)["entry-1_service_1_register_e1_peak_usage"]
+    uploaded, _queries = _install_recorder_stubs(monkeypatch, [])
+
+    coordinator.set_summary(
+        {
+            **summary,
+            "registers": [
+                register
+                for register in summary["registers"]
+                if register["slug"] != "e1_peak_usage"
+            ],
+        }
+    )
+    for listener in coordinator.listeners:
+        listener()
+
+    assert peak.available is False
+    assert peak.native_value is None
+    assert peak.extra_state_attributes["register_key"] is None
+    asyncio.run(peak._async_upload_statistics())
+    assert uploaded == []
+    assert len(_register_entities(added)) == 5
+
+    coordinator.set_summary(summary)
+    assert peak.available is True
+    coordinator.last_update_success = False
+    assert peak.available is False
+
+
+def test_dynamic_usage_entities_skip_gas_and_missing_details() -> None:
+    """Discovery ignores gas services and services without usage data."""
+    gas = {"accountServiceId": 2, "serviceType": "Gas"}
+
+    class Coordinator:
+        data = {
+            "services": [gas, {"accountServiceId": 3, "serviceType": "Power"}],
+            "service_data": {"2": {"usage_summary": {"registers": []}}, "3": None},
+        }
+
+    assert (
+        sensor._dynamic_usage_entities(Coordinator(), FakeEntry(), set()) == []  # type: ignore[arg-type]
+    )
+
+
+def test_daily_statistics_sensor_requires_upload_implementation() -> None:
+    """The shared daily statistics base has no series of its own."""
+    entity = sensor.GloBirdDailyStatisticsSensor(
+        _UsageCoordinator({}), FakeEntry(), _POWER_SERVICE
+    )
+    try:
+        asyncio.run(entity._async_upload_statistics())
+    except NotImplementedError:
+        pass
+    else:
+        raise AssertionError("expected NotImplementedError")
+
+
+def test_daily_statistics_uploads_run_one_at_a_time() -> None:
+    """Overlapping uploads of one entity are serialised (anchor read + write)."""
+    events: list[str] = []
+
+    class Sensor(sensor.GloBirdDailyStatisticsSensor):
+        async def _async_upload_statistics(self) -> None:
+            events.append("start")
+            await asyncio.sleep(0)
+            events.append("end")
+
+    entity = Sensor(_UsageCoordinator({}), FakeEntry(), _POWER_SERVICE)
+
+    async def run_two() -> None:
+        tasks: list[Any] = []
+        entity.hass = types.SimpleNamespace(
+            async_create_task=lambda coro: tasks.append(asyncio.ensure_future(coro))
+        )
+        added = asyncio.ensure_future(entity.async_added_to_hass())
+        entity._handle_coordinator_update()
+        await asyncio.gather(added, *tasks)
+
+    asyncio.run(run_two())
+
+    assert events == ["start", "end", "start", "end"]
+
+
+def test_daily_upload_waits_for_recorder_commit(monkeypatch: Any) -> None:
+    """The upload waits for the queued import to commit before returning."""
+    _install_recorder_stubs(monkeypatch, [])
+    events: list[str] = []
+
+    async def run() -> None:
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+
+        class Recorder:
+            async def async_add_executor_job(self, func: Any, *args: Any) -> Any:
+                return func(*args)
+
+            def async_get_commit_future(self) -> Any:
+                events.append("commit requested")
+                loop.call_soon(
+                    lambda: (events.append("committed"), future.set_result(None))
+                )
+                return future
+
+        sys.modules["homeassistant.helpers.recorder"].get_instance = lambda _hass: (
+            Recorder()
+        )
+        await _usage_total_entity(_DAILY)._async_upload_statistics()
+        events.append("upload returned")
+
+    asyncio.run(run())
+
+    assert events == ["commit requested", "committed", "upload returned"]
+
+
+def test_daily_upload_commit_wait_is_bounded(monkeypatch: Any) -> None:
+    """A recorder that never commits does not block the upload forever."""
+    uploaded, _queries = _install_recorder_stubs(monkeypatch, [])
+    monkeypatch.setattr(sensor, "RECORDER_COMMIT_TIMEOUT", 0)
+
+    async def run() -> None:
+        never = asyncio.get_running_loop().create_future()
+
+        class Recorder:
+            async def async_add_executor_job(self, func: Any, *args: Any) -> Any:
+                return func(*args)
+
+            def async_get_commit_future(self) -> Any:
+                return never
+
+        sys.modules["homeassistant.helpers.recorder"].get_instance = lambda _hass: (
+            Recorder()
+        )
+        await _usage_total_entity(_DAILY)._async_upload_statistics()
+
+    asyncio.run(run())
+
+    assert len(uploaded) == 1
+
+
+def test_daily_upload_ignores_stored_rows_without_start(monkeypatch: Any) -> None:
+    """A stored row without a start time cannot anchor the upload."""
+    uploaded, _queries = _install_recorder_stubs(
+        monkeypatch, [{"start": None, "state": 1.0, "sum": 99.0}]
+    )
+
+    asyncio.run(_usage_total_entity(_DAILY)._async_upload_statistics())
+
+    assert [row["sum"] for row in uploaded[0][1]] == [2.0, 5.0]
+
+
+def test_daily_statistics_update_without_task_support_skips_upload(
+    monkeypatch: Any,
+) -> None:
+    """A coordinator update without ``async_create_task`` uploads nothing."""
+    uploaded, _queries = _install_recorder_stubs(monkeypatch, [])
+    entity = _usage_total_entity(_DAILY)
+    entity.hass = types.SimpleNamespace()
+
+    entity._handle_coordinator_update()
+
+    assert uploaded == []
+
+
+def test_controlled_load_sensors_without_values() -> None:
+    """Controlled-load sensors fall back cleanly when no value or day exists."""
+    coordinator = _UsageCoordinator(
+        {"total_controlled_load": None, "controlled_load_daily": []}
+    )
+    total = sensor.GloBirdControlledLoadTotalSensor(
+        coordinator, FakeEntry(), _POWER_SERVICE
+    )
+    latest = sensor.GloBirdLatestDayControlledLoadSensor(
+        coordinator, FakeEntry(), _POWER_SERVICE
+    )
+
+    assert total.native_value == 0.0
+    assert latest.native_value is None
+    assert latest.last_reset is None
+    coordinator.set_summary({"controlled_load_daily": ["not-a-row"]})
+    assert latest.last_reset is None
+
+    coordinator.data["service_data"] = {}
+    assert total.native_value is None
+
+
+def test_usage_register_sensor_name_falls_back_to_slug() -> None:
+    """A register without suffix or charge type is named after its slug."""
+    entity = sensor.GloBirdUsageRegisterSensor(
+        _UsageCoordinator({"registers": ["not-a-register"]}),
+        FakeEntry(),
+        _POWER_SERVICE,
+        {"slug": "unknown"},
+    )
+
+    assert entity._attr_name == "Recent unknown"
+    assert entity._attr_unique_id == "entry-1_service_1_register_unknown"
+    assert entity._attr_icon == "mdi:chart-timeline-variant"
+    assert entity.available is False
+
+
+def test_daily_upload_accepts_synchronous_recorder_api(monkeypatch: Any) -> None:
+    """A non-awaitable ``async_add_external_statistics`` result is accepted."""
+    _install_recorder_stubs(monkeypatch, [])
+    calls: list[Any] = []
+    statistics_module = sys.modules["homeassistant.components.recorder.statistics"]
+    monkeypatch.setattr(
+        statistics_module,
+        "async_add_external_statistics",
+        lambda _hass, meta, stats: calls.append((meta, stats)),
+    )
+
+    asyncio.run(_usage_total_entity(_DAILY)._async_upload_statistics())
+
+    assert [row["sum"] for row in calls[0][1]] == [2.0, 5.0]

@@ -7,6 +7,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 type UsageDirection = Literal["import", "export"]
+type UsageClass = Literal["general_import", "controlled_load", "export", "tracking"]
 type DataReadinessStatus = Literal[
     "ready",
     "waiting_for_cost",
@@ -58,18 +59,30 @@ class UsageDailyRow(ApiModel):
         return _coerce_optional_float(value)
 
 
+class UsageTimePeriod(ApiModel):
+    """Time-of-use window of a usage register, as ``HH:MM`` (end may be 24:00)."""
+
+    start: str | None = None
+    end: str | None = None
+
+
 class UsageRegisterSummary(ApiModel):
     """Per-register (e.g. E1 import or B1 solar export) usage summary."""
 
     key: str = "unknown"
+    slug: str = "unknown"
     suffix: str | None = None
     chargeType: str | None = None
     chargeCategoryCode: str | None = None
     direction: UsageDirection = "import"
+    usage_class: UsageClass = "general_import"
+    register_sensor: bool = False
+    time_periods: list[UsageTimePeriod] = Field(default_factory=list)
     days: int = Field(default=0, ge=0)
     total: float | None = None
     latest_day: str | None = None
     latest_day_usage: float | None = None
+    daily: list[UsageDailyRow] = Field(default_factory=list)
 
     @field_validator("total", "latest_day_usage", mode="before")
     @classmethod
@@ -89,6 +102,9 @@ class UsageSummary(ApiModel):
     total_export: float | None = None
     latest_day_export: float | None = None
     export_daily: list[UsageDailyRow] = Field(default_factory=list)
+    total_controlled_load: float | None = None
+    latest_day_controlled_load: float | None = None
+    controlled_load_daily: list[UsageDailyRow] = Field(default_factory=list)
     registers: list[UsageRegisterSummary] = Field(default_factory=list)
 
     @field_validator(
@@ -96,6 +112,8 @@ class UsageSummary(ApiModel):
         "latest_day_usage",
         "total_export",
         "latest_day_export",
+        "total_controlled_load",
+        "latest_day_controlled_load",
         mode="before",
     )
     @classmethod

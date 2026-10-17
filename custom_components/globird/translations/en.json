@@ -123,6 +123,15 @@
       "latest_day_solar_export": {
         "name": "Latest Day Solar Export"
       },
+      "controlled_load_total": {
+        "name": "Recent Controlled Load Total"
+      },
+      "latest_day_controlled_load": {
+        "name": "Latest Day Controlled Load"
+      },
+      "usage_register": {
+        "name": "Usage Register"
+      },
       "cost_total": {
         "name": "Recent Cost Total"
       },

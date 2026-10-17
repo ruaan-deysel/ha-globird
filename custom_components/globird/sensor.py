@@ -561,13 +561,17 @@ GLOBAL_SENSORS: tuple[GloBirdSensorDescription, ...] = (
 
 
 def _create_background_upload(
-    entity: CoordinatorEntity[GloBirdCoordinator],
+    entity: GloBirdBaseSensor,
     upload: Coroutine[Any, Any, None],
     kind: str,
 ) -> None:
-    """Start a statistics upload that Home Assistant does not wait for."""
-    entity.hass.async_create_background_task(
-        upload, f"globird {kind} upload {entity.entity_id}"
+    """Start a statistics upload that Home Assistant does not wait for.
+
+    The task belongs to the config entry, so unloading or reloading the
+    entry cancels it before a new entity can start its own upload.
+    """
+    entity._config_entry.async_create_background_task(
+        entity.hass, upload, f"globird {kind} upload {entity.entity_id}"
     )
 
 
@@ -1238,6 +1242,16 @@ class GloBirdLatestGasReadingSensor(GloBirdServiceBaseSensor):
     # carries the cumulative sum and is the Energy dashboard gas source.
     sensor_state_class = None
 
+    def __init__(
+        self,
+        coordinator: GloBirdCoordinator,
+        config_entry: ConfigEntry,
+        service: dict[str, Any],
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, config_entry, service)
+        self._statistics_lock = asyncio.Lock()
+
     async def async_added_to_hass(self) -> None:
         """Upload historical gas readings once Home Assistant has started."""
         await super().async_added_to_hass()
@@ -1249,14 +1263,19 @@ class GloBirdLatestGasReadingSensor(GloBirdServiceBaseSensor):
     def _async_start_statistics_upload(self, _hass: HomeAssistant) -> None:
         """Run the first gas history upload in the background."""
         _create_background_upload(
-            self, self._async_upload_historical_statistics(), "gas statistics"
+            self, self._async_upload_gas_statistics_serialised(), "gas statistics"
         )
 
     def _handle_coordinator_update(self) -> None:
         """Refresh the entity and import any newly published gas reads."""
         super()._handle_coordinator_update()
         if hasattr(self.hass, "async_create_task"):
-            self.hass.async_create_task(self._async_upload_historical_statistics())
+            self.hass.async_create_task(self._async_upload_gas_statistics_serialised())
+
+    async def _async_upload_gas_statistics_serialised(self) -> None:
+        """Upload the gas history after any earlier upload has finished."""
+        async with self._statistics_lock:
+            await self._async_upload_historical_statistics()
 
     async def _async_upload_historical_statistics(self) -> None:
         """Import all historical gas meter reads as external statistics."""
@@ -1357,6 +1376,8 @@ class GloBirdLatestGasReadingSensor(GloBirdServiceBaseSensor):
                 statistic_id,
                 err,
             )
+            return
+        await self._async_wait_for_statistics_commit(statistic_id)
 
     @property
     def native_value(self) -> Any:

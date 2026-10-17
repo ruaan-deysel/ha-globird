@@ -10,7 +10,7 @@ This project uses Home Assistant's calendar versioning scheme (`YYYY.M.P`, for e
 
 ### Fixed
 
-- **2026.10.3 failed to set up after a restart** ([#23](https://github.com/tinkerologie/ha-globird/issues/23)): sensors uploaded their long-term statistics during entity setup and waited for the recorder to commit each one, but the recorder does not commit until Home Assistant has finished starting, so setup hit the 5-minute bootstrap timeout and was cancelled. Statistics uploads now start in the background once Home Assistant has started (or straight away when the entry is reloaded), and never block setup.
+- **2026.10.3 failed to set up after a restart** ([#23](https://github.com/tinkerologie/ha-globird/issues/23)): sensors uploaded their long-term statistics during entity setup and waited for the recorder to commit each one, but the recorder does not commit until Home Assistant has finished starting, so setup hit the 5-minute bootstrap timeout and was cancelled. Statistics uploads now start in a background task owned by the config entry once Home Assistant has started (or straight away when the entry is reloaded), and never block setup. Gas history uploads now run one at a time and wait for the recorder commit, like the electricity statistics, so a refresh during the first upload cannot overwrite newer rows with an older snapshot.
 
 ## [2026.10.3] - 2026-10-17
 

@@ -716,6 +716,29 @@ def test_usage_summary_sums_intervals_that_differ_per_row() -> None:
 
     assert usage["latest_intervals"] == [1.0, 2.0]
 
+    # A longer array from another channel only adds to existing intervals.
+    longer = build_usage_summary(
+        {
+            "data": [
+                {
+                    "readDate": "2026-04-24",
+                    "usage": 1.0,
+                    "suffix": "E1",
+                    "chargeCategoryCode": "USAGE",
+                    "usageArray": [1.0],
+                },
+                {
+                    "readDate": "2026-04-24",
+                    "usage": 1.0,
+                    "suffix": "E2",
+                    "chargeCategoryCode": "USAGE",
+                    "usageArray": [0.5, 9.0],
+                },
+            ]
+        }
+    )
+    assert longer["latest_intervals"] == [1.5]
+
 
 def test_cost_usage_quantities_match_energy_registers_live_shape() -> None:
     """The portal bills only the energy registers, confirming the #17 split."""
@@ -765,6 +788,28 @@ def test_usage_registers_expose_time_periods_daily_and_sensor_flag() -> None:
         "e1_offpeak_usage",
         "e1_peak_usage",
         "e1_shoulder_usage",
+    ]
+
+
+def test_usage_attributes_list_export_registers_for_export_sensors() -> None:
+    """Export sensors list B1 registers, including the add-on tracking row."""
+    usage = build_usage_summary(load_zerohero_fixtures()["electricity_usage"])
+
+    export_attrs = usage_attributes(usage, direction="export")
+    import_attrs = usage_attributes(usage, direction="import")
+
+    assert [register["key"] for register in export_attrs["registers"]] == [
+        "B1-Solar/Generation Feed in (11pm-4pm)",
+        "B1-Solar/Generation Feed in (4pm-11pm)",
+        "B1-Super Export top up",
+    ]
+    assert export_attrs["registers"][2]["usage_class"] == "tracking"
+    assert export_attrs["daily_count"] == 3
+    assert [register["key"] for register in import_attrs["registers"]] == [
+        "E1-Offpeak Usage",
+        "E1-Peak Usage",
+        "E1-Shoulder Usage",
+        "E1-ZeroHero",
     ]
 
 
@@ -1631,6 +1676,7 @@ def load_tests(
         test_cost_usage_quantities_match_energy_registers_live_shape,
         test_usage_registers_expose_time_periods_daily_and_sensor_flag,
         test_flat_rate_registers_get_no_register_sensor,
+        test_usage_attributes_list_export_registers_for_export_sensors,
         test_usage_classification_edge_cases,
         test_usage_summary_with_only_tracking_rows_keeps_registers,
         test_controlled_load_registers_are_split_from_general_import,

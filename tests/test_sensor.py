@@ -1872,3 +1872,80 @@ def test_daily_upload_commit_wait_is_bounded(monkeypatch: Any) -> None:
     asyncio.run(run())
 
     assert len(uploaded) == 1
+
+
+def test_daily_upload_ignores_stored_rows_without_start(monkeypatch: Any) -> None:
+    """A stored row without a start time cannot anchor the upload."""
+    uploaded, _queries = _install_recorder_stubs(
+        monkeypatch, [{"start": None, "state": 1.0, "sum": 99.0}]
+    )
+
+    asyncio.run(_usage_total_entity(_DAILY)._async_upload_statistics())
+
+    assert [row["sum"] for row in uploaded[0][1]] == [2.0, 5.0]
+
+
+def test_daily_statistics_update_without_task_support_skips_upload(
+    monkeypatch: Any,
+) -> None:
+    """A coordinator update without ``async_create_task`` uploads nothing."""
+    uploaded, _queries = _install_recorder_stubs(monkeypatch, [])
+    entity = _usage_total_entity(_DAILY)
+    entity.hass = types.SimpleNamespace()
+
+    entity._handle_coordinator_update()
+
+    assert uploaded == []
+
+
+def test_controlled_load_sensors_without_values() -> None:
+    """Controlled-load sensors fall back cleanly when no value or day exists."""
+    coordinator = _UsageCoordinator(
+        {"total_controlled_load": None, "controlled_load_daily": []}
+    )
+    total = sensor.GloBirdControlledLoadTotalSensor(
+        coordinator, FakeEntry(), _POWER_SERVICE
+    )
+    latest = sensor.GloBirdLatestDayControlledLoadSensor(
+        coordinator, FakeEntry(), _POWER_SERVICE
+    )
+
+    assert total.native_value == 0.0
+    assert latest.native_value is None
+    assert latest.last_reset is None
+    coordinator.set_summary({"controlled_load_daily": ["not-a-row"]})
+    assert latest.last_reset is None
+
+    coordinator.data["service_data"] = {}
+    assert total.native_value is None
+
+
+def test_usage_register_sensor_name_falls_back_to_slug() -> None:
+    """A register without suffix or charge type is named after its slug."""
+    entity = sensor.GloBirdUsageRegisterSensor(
+        _UsageCoordinator({"registers": ["not-a-register"]}),
+        FakeEntry(),
+        _POWER_SERVICE,
+        {"slug": "unknown"},
+    )
+
+    assert entity._attr_name == "Recent unknown"
+    assert entity._attr_unique_id == "entry-1_service_1_register_unknown"
+    assert entity._attr_icon == "mdi:chart-timeline-variant"
+    assert entity.available is False
+
+
+def test_daily_upload_accepts_synchronous_recorder_api(monkeypatch: Any) -> None:
+    """A non-awaitable ``async_add_external_statistics`` result is accepted."""
+    _install_recorder_stubs(monkeypatch, [])
+    calls: list[Any] = []
+    statistics_module = sys.modules["homeassistant.components.recorder.statistics"]
+    monkeypatch.setattr(
+        statistics_module,
+        "async_add_external_statistics",
+        lambda _hass, meta, stats: calls.append((meta, stats)),
+    )
+
+    asyncio.run(_usage_total_entity(_DAILY)._async_upload_statistics())
+
+    assert [row["sum"] for row in calls[0][1]] == [2.0, 5.0]

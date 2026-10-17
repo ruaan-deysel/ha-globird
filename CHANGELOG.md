@@ -6,6 +6,12 @@ This project uses Home Assistant's calendar versioning scheme (`YYYY.M.P`, for e
 
 ## [Unreleased]
 
+## [2026.10.4] - 2026-10-17
+
+### Fixed
+
+- **2026.10.3 failed to set up after a restart** ([#23](https://github.com/tinkerologie/ha-globird/issues/23)): sensors uploaded their long-term statistics during entity setup and waited for the recorder to commit each one, but the recorder does not commit until Home Assistant has finished starting, so setup hit the 5-minute bootstrap timeout and was cancelled. Statistics uploads now start in the background once Home Assistant has started (or straight away when the entry is reloaded), and never block setup.
+
 ## [2026.10.3] - 2026-10-17
 
 ### Added

@@ -85,6 +85,7 @@ Go to **Settings > Dashboards > Energy** to configure usage and cost tracking:
   - Select `sensor.glo_bird_energy_recent_solar_export_total` (*Recent Solar Export Total*) or `sensor.glo_bird_energy_latest_day_solar_export` (*Latest Day Solar Export*). Plans with several feed-in windows also get one `globird:<entry>_service_<id>_register_<register>` statistic per window; as above, use either the total or the windows.
 
 ### How usage registers are counted
+
 The portal returns one row per meter register and day (`E1` import, `B1` export, and so on). Only rows whose `chargeCategoryCode` is an energy category count towards the usage, export and controlled-load totals: `USAGE`, `CONTROL`, `CLIMATE` and `SOLAR` (the same list GloBird's own portal totals), plus rows without a category. Other rows, such as ZEROHERO's `ZeroHero` (`LOW_USAGE_REWARD_PER_DAY`, 18:00–21:00) and `Super Export top up` (`ADDON_FEED_IN`, 18:00–21:00), only re-report part of a time-of-use window for a reward, so they are listed in the `registers` attribute with `usage_class: tracking` but not added to any total. Rows with category `CONTROL` are controlled load; every other import row is general import.
 
 The daily `globird:` statistics are imported again on every refresh for the last 31 days the portal returns. Each import continues the running total from the last stored row before that window, so older days stay in your long-term statistics after the portal stops returning them.

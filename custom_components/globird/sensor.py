@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from collections.abc import Callable
@@ -1012,18 +1013,36 @@ class GloBirdDailyStatisticsSensor(GloBirdServiceBaseSensor):
 
     The series is uploaded when the entity is added and after every
     coordinator update. Subclasses implement ``_async_upload_statistics``.
+    Uploads of one entity run one at a time, so reading the stored row that
+    anchors the sum and writing the new rows cannot interleave with another
+    upload.
     """
+
+    def __init__(
+        self,
+        coordinator: GloBirdCoordinator,
+        config_entry: ConfigEntry,
+        service: dict[str, Any],
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, config_entry, service)
+        self._statistics_lock = asyncio.Lock()
 
     async def async_added_to_hass(self) -> None:
         """Upload the daily series to recorder long-term statistics."""
         await super().async_added_to_hass()
-        await self._async_upload_statistics()
+        await self._async_upload_statistics_serialised()
 
     def _handle_coordinator_update(self) -> None:
         """Refresh the entity and import newly published statistics."""
         super()._handle_coordinator_update()
         if hasattr(self.hass, "async_create_task"):
-            self.hass.async_create_task(self._async_upload_statistics())
+            self.hass.async_create_task(self._async_upload_statistics_serialised())
+
+    async def _async_upload_statistics_serialised(self) -> None:
+        """Upload the daily series after any earlier upload has finished."""
+        async with self._statistics_lock:
+            await self._async_upload_statistics()
 
     async def _async_upload_statistics(self) -> None:
         """Upload this sensor's daily series."""

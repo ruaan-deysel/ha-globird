@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import calendar
+import hashlib
 import html
 import json
 import logging
@@ -672,18 +673,22 @@ def _build_usage_register_summaries(
     for row in rows:
         by_register.setdefault(_usage_register_key(row), []).append(row)
 
+    base_slug_counts: dict[str, int] = {}
+    for key in by_register:
+        base_slug = _usage_register_slug(key)
+        base_slug_counts[base_slug] = base_slug_counts.get(base_slug, 0) + 1
+
     summaries: list[dict[str, Any]] = []
-    used_slugs: set[str] = set()
     for key in sorted(by_register):
         register_rows = by_register[key]
         first = register_rows[0]
         summary = _build_register_summary(register_rows)
-        slug = base_slug = _usage_register_slug(key)
-        duplicate = 1
-        while slug in used_slugs:
-            duplicate += 1
-            slug = f"{base_slug}_{duplicate}"
-        used_slugs.add(slug)
+        slug = _usage_register_slug(key)
+        if base_slug_counts[slug] > 1:
+            # Keys that differ only in case or punctuation: derive the suffix
+            # from the key itself so neither register's ID depends on the
+            # other being present or on sort order.
+            slug = f"{slug}_{hashlib.sha256(key.encode()).hexdigest()[:8]}"
         summaries.append(
             {
                 "key": key,

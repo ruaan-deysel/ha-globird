@@ -1787,3 +1787,29 @@ def test_daily_statistics_sensor_requires_upload_implementation() -> None:
         pass
     else:
         raise AssertionError("expected NotImplementedError")
+
+
+def test_daily_statistics_uploads_run_one_at_a_time() -> None:
+    """Overlapping uploads of one entity are serialised (anchor read + write)."""
+    events: list[str] = []
+
+    class Sensor(sensor.GloBirdDailyStatisticsSensor):
+        async def _async_upload_statistics(self) -> None:
+            events.append("start")
+            await asyncio.sleep(0)
+            events.append("end")
+
+    entity = Sensor(_UsageCoordinator({}), FakeEntry(), _POWER_SERVICE)
+
+    async def run_two() -> None:
+        tasks: list[Any] = []
+        entity.hass = types.SimpleNamespace(
+            async_create_task=lambda coro: tasks.append(asyncio.ensure_future(coro))
+        )
+        added = asyncio.ensure_future(entity.async_added_to_hass())
+        entity._handle_coordinator_update()
+        await asyncio.gather(added, *tasks)
+
+    asyncio.run(run_two())
+
+    assert events == ["start", "end", "start", "end"]

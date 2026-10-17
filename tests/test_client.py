@@ -927,11 +927,35 @@ def test_register_slugs_stay_unique() -> None:
         }
     )
 
-    assert sorted(register["slug"] for register in usage["registers"]) == [
-        "e1_peak_usage",
-        "e1_peak_usage_2",
-        "unknown",
-    ]
+    slugs = {register["key"]: register["slug"] for register in usage["registers"]}
+    assert slugs["unknown"] == "unknown"
+    assert slugs["E1-Peak Usage"].startswith("e1_peak_usage_")
+    assert slugs["E1-Peak-Usage"].startswith("e1_peak_usage_")
+    assert slugs["E1-Peak Usage"] != slugs["E1-Peak-Usage"]
+
+    # The suffix comes from the key alone, not from the other colliding key.
+    alone = build_usage_summary(
+        {
+            "data": [
+                {
+                    "readDate": "2026-05-01",
+                    "usage": 1.0,
+                    "suffix": "E1",
+                    "chargeType": "Peak-Usage",
+                    "chargeCategoryCode": "USAGE",
+                },
+                {
+                    "readDate": "2026-05-01",
+                    "usage": 1.0,
+                    "suffix": "e1",
+                    "chargeType": "peak usage",
+                    "chargeCategoryCode": "USAGE",
+                },
+            ]
+        }
+    )
+    alone_slugs = {r["key"]: r["slug"] for r in alone["registers"]}
+    assert alone_slugs["E1-Peak-Usage"] == slugs["E1-Peak-Usage"]
 
 
 def test_cost_summary_exposes_new_category_totals() -> None:
